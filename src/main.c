@@ -41,6 +41,7 @@
 #include "cache.h"
 #include "process_utils.h"
 #include "output_metadata.h"
+#include "niri.h"
 
 #ifdef HAVE_SYSTEMD
 #include <systemd/sd-daemon.h>
@@ -191,6 +192,16 @@ static bool restore_paused = false;
 // halt_info.is_paused for their own holds but never touch this flag.
 static bool ipc_paused = false;
 
+// --niri: pause while niri reports a focused fullscreen window.
+// The monitor thread publishes its decision in niri_wants_pause and wakes the
+// main loop, which reconciles it into the niri_paused hold (see
+// process_niri_pause()). Like ipc_paused, niri_paused is written only from
+// the main loop.
+static bool niri_enabled = false;
+static niri_monitor_config niri_config = {0};
+static atomic_bool niri_wants_pause = false;
+static bool niri_paused = false;
+
 // Cache configuration
 static size_t cache_size_mb = DEFAULT_CACHE_SIZE_MB;
 
@@ -261,7 +272,8 @@ static struct {
 
 } halt_info = {NULL, NULL, 0, NULL, NULL, 0, 0, 0, 0, 0};
 
-static pthread_t threads[5] = {0};
+// gst events, auto-pause/stop, pauselist, stoplist, niri, plus the 0 terminator
+static pthread_t threads[6] = {0};
 
 static uint SLIDESHOW_TIME = 0;
 static bool SHOW_OUTPUTS = false;
@@ -1508,7 +1520,10 @@ static void save_current_state(void) {
             if (gst_element_query_position(pipeline, GST_FORMAT_TIME, &pos_ns)) {
                 state.position = (double)pos_ns / GST_SECOND;
             }
-            state.paused = (gst_state == GST_STATE_PAUSED);
+            // A pause held only by --niri reflects the window layout at exit,
+            // not a choice to keep the wallpaper paused across restarts
+            bool niri_only_pause = niri_paused && halt_info.is_paused == 1;
+            state.paused = (gst_state == GST_STATE_PAUSED) && !niri_only_pause;
         } else {
             // Pipeline shutting down, use last known position or 0
             state.position = 0.0;
@@ -1903,6 +1918,40 @@ static void *handle_auto_stop(void *_) {
         }
     }
     pthread_exit(NULL);
+}
+
+// Runs on the niri monitor thread. Records the decision and wakes the main
+// loop, which applies it in process_niri_pause().
+static void niri_pause_changed(bool should_pause, void *userdata) {
+    (void)userdata;
+    atomic_store(&niri_wants_pause, should_pause);
+    if (write(wakeup_pipe[1], "n", 1) == -1 && errno != EAGAIN) {
+        cflp_warning("Failed to write to wakeup pipe");
+    }
+}
+
+// Takes or releases the --niri pause hold to match the monitor's latest
+// decision. Called from the main loop.
+static void process_niri_pause(void) {
+    bool wants_pause = atomic_load(&niri_wants_pause);
+    if (wants_pause == niri_paused)
+        return;
+    niri_paused = wants_pause;
+
+    if (wants_pause) {
+        if (VERBOSE)
+            cflp_info("Pausing because a fullscreen window is focused in niri");
+        halt_info.is_paused++;
+        if (pipeline)
+            gst_element_set_state(pipeline, GST_STATE_PAUSED);
+    } else {
+        if (VERBOSE)
+            cflp_info("Releasing niri pause: no fullscreen window is focused");
+        if (halt_info.is_paused > 0)
+            halt_info.is_paused--;
+        if (!halt_info.is_paused && pipeline)
+            gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    }
 }
 
 // GStreamer event handling
@@ -2536,6 +2585,11 @@ static void init_threads() {
     }
     if (halt_info.stoplist) {
         pthread_create(&threads[id], NULL, monitor_stoplist, NULL);
+        id++;
+    }
+
+    if (niri_enabled) {
+        pthread_create(&threads[id], NULL, niri_monitor_thread, &niri_config);
         id++;
     }
 }
@@ -3734,6 +3788,7 @@ static void parse_command_line(int argc, char **argv, struct wl_state *state) {
         {"state-file", required_argument, NULL, 1001},
         {"no-save-state", no_argument, NULL, 1002},
         {"cache-size", required_argument, NULL, 1003},
+        {"niri", no_argument, NULL, 1004},
         {0, 0, 0, 0}
     };
 
@@ -3763,6 +3818,7 @@ static void parse_command_line(int argc, char **argv, struct wl_state *state) {
         "--state-file PATH              Use a custom state file path\n"
         "--no-save-state                Disable automatic state saving on exit\n"
         "--cache-size MB                 Image cache size in MB (default: 256, 0 to disable)\n"
+        "--niri                         Pause playback while a fullscreen window is focused in niri\n"
         "\n"
         "Scaling modes (use with -o):\n"
         "  fill        Fill screen maintaining aspect ratio, crop excess (default for images)\n"
@@ -3905,6 +3961,9 @@ static void parse_command_line(int argc, char **argv, struct wl_state *state) {
                         cache_size_mb = (size_t)size;
                     }
                 }
+                break;
+            case 1004: // --niri
+                niri_enabled = true;
                 break;
         }
     }
@@ -4089,6 +4148,20 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
+    if (niri_enabled) {
+        const char *niri_socket = getenv("NIRI_SOCKET");
+        if (niri_socket && niri_socket[0] != '\0') {
+            niri_config = (niri_monitor_config){
+                .socket_path = niri_socket,
+                .on_change = niri_pause_changed,
+                .verbose = VERBOSE,
+            };
+        } else {
+            cflp_warning("--niri given but NIRI_SOCKET is not set; fullscreen pausing disabled");
+            niri_enabled = false;
+        }
+    }
+
     // Start monitoring threads after surfaces are ready
     init_threads();
 
@@ -4124,6 +4197,9 @@ int main(int argc, char **argv) {
         // Handle stop/exit requests recorded by the monitor threads and the
         // GStreamer bus error path (see request_stop_from_thread()).
         process_pending_stop();
+
+        // Apply the latest --niri fullscreen decision (see niri_pause_changed()).
+        process_niri_pause();
 
 
         // If wl_display_prepare_read() was successful as 0

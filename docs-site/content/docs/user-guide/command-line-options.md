@@ -56,6 +56,18 @@ Automatically stop when wallpaper is hidden.
 gslapper -s -o "loop" DP-1 video.mp4
 ```
 
+### `--niri`
+
+Pause playback while a fullscreen window is focused in [niri](https://github.com/YaLTeR/niri).
+
+```bash
+gslapper --niri -o "loop" DP-1 video.mp4
+```
+
+gSlapper follows niri's IPC event stream through `$NIRI_SOCKET` (niri sets it for programs it starts and, when run as a systemd session, for user services). A window counts as fullscreen when its tile covers its whole output, so windows maximized to the screen edges also pause playback. Playback resumes when focus moves elsewhere, the window leaves fullscreen, the overview opens, or its output is disconnected. If niri cannot be reached, playback continues and gSlapper keeps retrying in the background.
+
+The pause combines with IPC `pause`/`resume`: a wallpaper paused over IPC stays paused after the fullscreen window loses focus.
+
 ### `-r, --fps-cap FPS`
 
 Set frame rate cap. Available values: 30, 60, or 100 FPS.

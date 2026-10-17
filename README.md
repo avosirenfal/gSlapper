@@ -28,6 +28,7 @@ Full documentation available at: https://nomadcxx.github.io/gSlapper/
 - Fade transitions between images
 - Multi-monitor support
 - IPC control via Unix socket (pause, resume, change wallpaper)
+- Pause while a fullscreen window is focused in niri (`--niri`)
 - Scaling modes: fill, stretch, original, panscan
 - Lower CPU, RAM, and GPU use than mpvpaper on any Wayland compositor
 
