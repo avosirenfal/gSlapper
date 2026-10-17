@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -42,6 +43,8 @@
 #include "process_utils.h"
 #include "output_metadata.h"
 #include "niri.h"
+#include "playlist.h"
+#include "slideshow.h"
 
 #ifdef HAVE_SYSTEMD
 #include <systemd/sd-daemon.h>
@@ -202,6 +205,23 @@ static niri_monitor_config niri_config = {0};
 static atomic_bool niri_wants_pause = false;
 static bool niri_paused = false;
 
+// Folder slideshow, active when the wallpaper path names a folder (see
+// start_slideshow()). The slideshow owns its pipelines; `pipeline` holds an
+// extra reference to the one on screen so pausing, IPC and state saving keep
+// working unchanged.
+#define SLIDESHOW_DEFAULT_INTERVAL_SECS 300
+static slideshow *slideshow_instance = NULL;
+static size_t preload_limit_mb = 512;
+
+// Texture holding a slideshow slot's latest frame, matched to it by id
+typedef struct {
+    uint64_t slot_id;
+    GLuint texture; // 0 when the entry is unused
+    int width, height;
+} slide_texture;
+static slide_texture slide_textures[2];
+static GLuint layer_shader_program = 0;
+
 // Cache configuration
 static size_t cache_size_mb = DEFAULT_CACHE_SIZE_MB;
 
@@ -310,6 +330,7 @@ static void restore_video_position(void);
 static void notify_systemd_ready(void);
 static void notify_systemd_stopping(void);
 static bool is_all_outputs_selector(const char *monitor);
+static bool audio_disabled(void);
 
 // Cleanup function
 static void exit_cleanup() {
@@ -352,6 +373,26 @@ static void exit_cleanup() {
 
     // Clean up image cache
     cache_shutdown();
+
+    // Stop the slideshow's pipelines. Drop the `pipeline` alias first: the
+    // shutdown sequence below would otherwise restart a stopped slot pipeline.
+    if (slideshow_instance) {
+        if (pipeline) {
+            gst_object_unref(pipeline);
+            pipeline = NULL;
+        }
+        slideshow_free(slideshow_instance);
+        slideshow_instance = NULL;
+    }
+    for (size_t i = 0; i < sizeof(slide_textures) / sizeof(slide_textures[0]); i++) {
+        if (slide_textures[i].texture != 0)
+            glDeleteTextures(1, &slide_textures[i].texture);
+        slide_textures[i] = (slide_texture){0};
+    }
+    if (layer_shader_program != 0) {
+        glDeleteProgram(layer_shader_program);
+        layer_shader_program = 0;
+    }
 
     // Clean up transition resources
     cancel_transition();
@@ -697,8 +738,10 @@ static void process_pending_stop(void) {
 
 const static struct wl_callback_listener wl_surface_frame_listener;
 
-static GLuint create_shader_program() {
-    const char *vertex_shader_source = 
+// Compiles the shared quad vertex shader with fragment_shader_source and
+// links them. Returns 0, after logging, on failure.
+static GLuint build_quad_shader_program(const char *fragment_shader_source, const char *label) {
+    const char *vertex_shader_source =
         "#version 330 core\n"
         "layout (location = 0) in vec2 aPos;\n"
         "layout (location = 1) in vec2 aTexCoord;\n"
@@ -707,77 +750,77 @@ static GLuint create_shader_program() {
         "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
         "    TexCoord = aTexCoord;\n"
         "}\0";
-    
-    const char *fragment_shader_source = 
+
+    GLint success;
+    char info_log[512];
+    GLuint vertex_shader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vertex_shader, 1, &vertex_shader_source, NULL);
+    glCompileShader(vertex_shader);
+    glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        glGetShaderInfoLog(vertex_shader, sizeof(info_log), NULL, info_log);
+        cflp_error("%s vertex shader compilation failed: %s", label, info_log);
+        glDeleteShader(vertex_shader);
+        return 0;
+    }
+
+    GLuint fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fragment_shader, 1, &fragment_shader_source, NULL);
+    glCompileShader(fragment_shader);
+    glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        glGetShaderInfoLog(fragment_shader, sizeof(info_log), NULL, info_log);
+        cflp_error("%s fragment shader compilation failed: %s", label, info_log);
+        glDeleteShader(vertex_shader);
+        glDeleteShader(fragment_shader);
+        return 0;
+    }
+
+    GLuint program = glCreateProgram();
+    glAttachShader(program, vertex_shader);
+    glAttachShader(program, fragment_shader);
+    glLinkProgram(program);
+    glDeleteShader(vertex_shader);
+    glDeleteShader(fragment_shader);
+    glGetProgramiv(program, GL_LINK_STATUS, &success);
+    if (!success) {
+        glGetProgramInfoLog(program, sizeof(info_log), NULL, info_log);
+        cflp_error("%s shader program linking failed: %s", label, info_log);
+        glDeleteProgram(program);
+        return 0;
+    }
+    return program;
+}
+
+static GLuint create_shader_program() {
+    return build_quad_shader_program(
         "#version 330 core\n"
         "in vec2 TexCoord;\n"
         "out vec4 FragColor;\n"
         "uniform sampler2D ourTexture;\n"
         "void main() {\n"
         "    FragColor = texture(ourTexture, TexCoord);\n"
-        "}\0";
-    
-    GLuint vertex_shader = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource(vertex_shader, 1, &vertex_shader_source, NULL);
-    glCompileShader(vertex_shader);
-    
-    GLint success;
-    glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &success);
-    if (!success) {
-        char info_log[512];
-        glGetShaderInfoLog(vertex_shader, 512, NULL, info_log);
-        cflp_error("Vertex shader compilation failed: %s", info_log);
-        return 0;
-    }
-    
-    GLuint fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(fragment_shader, 1, &fragment_shader_source, NULL);
-    glCompileShader(fragment_shader);
-    
-    glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &success);
-    if (!success) {
-        char info_log[512];
-        glGetShaderInfoLog(fragment_shader, 512, NULL, info_log);
-        cflp_error("Fragment shader compilation failed: %s", info_log);
-        glDeleteShader(vertex_shader);
-        return 0;
-    }
-    
-    GLuint program = glCreateProgram();
-    glAttachShader(program, vertex_shader);
-    glAttachShader(program, fragment_shader);
-    glLinkProgram(program);
-    
-    glGetProgramiv(program, GL_LINK_STATUS, &success);
-    if (!success) {
-        char info_log[512];
-        glGetProgramInfoLog(program, 512, NULL, info_log);
-        cflp_error("Shader program linking failed: %s", info_log);
-        glDeleteShader(vertex_shader);
-        glDeleteShader(fragment_shader);
-        glDeleteProgram(program);
-        return 0;
-    }
-    
-    glDeleteShader(vertex_shader);
-    glDeleteShader(fragment_shader);
-    
-    return program;
+        "}\0",
+        "Video");
+}
+
+// Draws one texture at a given opacity, for slideshow layers
+static GLuint create_layer_shader_program(void) {
+    return build_quad_shader_program(
+        "#version 330 core\n"
+        "in vec2 TexCoord;\n"
+        "out vec4 FragColor;\n"
+        "uniform sampler2D layerTexture;\n"
+        "uniform float opacity;\n"
+        "void main() {\n"
+        "    FragColor = vec4(texture(layerTexture, TexCoord).rgb, opacity);\n"
+        "}\0",
+        "Slideshow");
 }
 
 // Create shader program for transition effects (blends two textures)
 static GLuint create_transition_shader_program() {
-    const char *vertex_shader_source = 
-        "#version 330 core\n"
-        "layout (location = 0) in vec2 aPos;\n"
-        "layout (location = 1) in vec2 aTexCoord;\n"
-        "out vec2 TexCoord;\n"
-        "void main() {\n"
-        "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
-        "    TexCoord = aTexCoord;\n"
-        "}\0";
-    
-    const char *fragment_shader_source = 
+    return build_quad_shader_program(
         "#version 330 core\n"
         "in vec2 TexCoord;\n"
         "out vec4 FragColor;\n"
@@ -788,54 +831,8 @@ static GLuint create_transition_shader_program() {
         "    vec4 oldColor = texture(oldTexture, TexCoord);\n"
         "    vec4 newColor = texture(newTexture, TexCoord);\n"
         "    FragColor = mix(oldColor, newColor, alpha);\n"
-        "}\0";
-    
-    GLuint vertex_shader = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource(vertex_shader, 1, &vertex_shader_source, NULL);
-    glCompileShader(vertex_shader);
-    
-    GLint success;
-    glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &success);
-    if (!success) {
-        char info_log[512];
-        glGetShaderInfoLog(vertex_shader, 512, NULL, info_log);
-        cflp_error("Transition vertex shader compilation failed: %s", info_log);
-        return 0;
-    }
-    
-    GLuint fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(fragment_shader, 1, &fragment_shader_source, NULL);
-    glCompileShader(fragment_shader);
-    
-    glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &success);
-    if (!success) {
-        char info_log[512];
-        glGetShaderInfoLog(fragment_shader, 512, NULL, info_log);
-        cflp_error("Transition fragment shader compilation failed: %s", info_log);
-        glDeleteShader(vertex_shader);
-        return 0;
-    }
-    
-    GLuint program = glCreateProgram();
-    glAttachShader(program, vertex_shader);
-    glAttachShader(program, fragment_shader);
-    glLinkProgram(program);
-    
-    glGetProgramiv(program, GL_LINK_STATUS, &success);
-    if (!success) {
-        char info_log[512];
-        glGetProgramInfoLog(program, 512, NULL, info_log);
-        cflp_error("Transition shader program linking failed: %s", info_log);
-        glDeleteShader(vertex_shader);
-        glDeleteShader(fragment_shader);
-        glDeleteProgram(program);
-        return 0;
-    }
-    
-    glDeleteShader(vertex_shader);
-    glDeleteShader(fragment_shader);
-    
-    return program;
+        "}\0",
+        "Transition");
 }
 
 // Check if transition should be used for this wallpaper change
@@ -1068,6 +1065,8 @@ static void cancel_transition(void) {
     }
 }
 
+static void set_quad_for_dimensions(struct display_output *output, int vid_width, int vid_height);
+
 // Update vertex data based on video dimensions and scaling options
 static void update_vertex_data(struct display_output *output) {
     if (vao == 0 || vbo == 0) {
@@ -1086,7 +1085,13 @@ static void update_vertex_data(struct display_output *output) {
             cflp_info("Invalid video dimensions (%dx%d)", vid_width, vid_height);
         return;
     }
-    
+
+    set_quad_for_dimensions(output, vid_width, vid_height);
+}
+
+// Fills the shared quad for a vid_width x vid_height picture on output,
+// scaled according to the -o scaling mode.
+static void set_quad_for_dimensions(struct display_output *output, int vid_width, int vid_height) {
     if (VERBOSE == 2)
         cflp_info("Updating vertex data with panscan_value=%.2f", panscan_value);
     
@@ -1184,36 +1189,39 @@ static void update_vertex_data(struct display_output *output) {
     }
 }
 
-static void render(struct display_output *output) {
-    // If using waylandsink, we don't need EGL rendering - waylandsink handles it
-    if (using_waylandsink) {
-        // Just schedule the next frame callback
-        output->frame_callback = wl_surface_frame(output->surface);
-        wl_callback_add_listener(output->frame_callback, &wl_surface_frame_listener, output);
-        output->redraw_needed = false;
+// Whether every frame must be drawn: during image transitions and
+// slideshow crossfades nothing else would trigger the redraws.
+static bool continuous_render_needed(void) {
+    return transition_state.active || (slideshow_instance && slideshow_fading(slideshow_instance));
+}
+
+// Creates the VAO and VBO for the textured quad on first use.
+static void ensure_quad_buffers(void) {
+    if (vao != 0)
         return;
-    }
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
 
-    // For image mode, only render once unless redraw explicitly needed or transitioning
-    if (is_image_mode && !output->redraw_needed && texture_manager.initialized && !transition_state.active) {
-        return;  // Image already rendered, no continuous updates needed
-    }
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
 
-    // Make sure we have a valid context
-    if (!eglMakeCurrent(egl_display, output->egl_surface, output->egl_surface, egl_context)) {
-        cflp_error("Failed to make output surface current");
-        return;
-    }
+    // Position attribute
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
 
-    glViewport(0, 0, output->width * output->scale, output->height * output->scale);
-    
-    // Clear with black background
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
+    // Texture coordinate attribute
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
 
-    // Update transition progress if active
-    update_transition();
+    glBindVertexArray(0);
 
+    if (VERBOSE)
+        cflp_info("Created VAO %u and VBO %u", vao, vbo);
+}
+
+// Draws the single wallpaper pipeline's latest frame, or the image
+// transition while one is running.
+static void draw_video_frame(struct display_output *output) {
     // Frame rate limiting for GPU optimization
     struct timespec current_time;
     clock_gettime(CLOCK_MONOTONIC, &current_time);
@@ -1295,27 +1303,7 @@ static void render(struct display_output *output) {
             cflp_info("Rendering transition frame (progress=%.2f, alpha_new=%.2f)", 
                      transition_state.progress, transition_state.alpha_new);
         
-        // Create VAO and VBO if needed (shared with normal rendering)
-        if (vao == 0) {
-            glGenVertexArrays(1, &vao);
-            glGenBuffers(1, &vbo);
-            
-            glBindVertexArray(vao);
-            glBindBuffer(GL_ARRAY_BUFFER, vbo);
-            
-            // Position attribute
-            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
-            glEnableVertexAttribArray(0);
-            
-            // Texture coordinate attribute
-            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
-            glEnableVertexAttribArray(1);
-            
-            glBindVertexArray(0);
-            
-            if (VERBOSE)
-                cflp_info("Created VAO %u and VBO %u", vao, vbo);
-        }
+        ensure_quad_buffers();
         
         // Update vertex data for new texture dimensions
         update_vertex_data(output);
@@ -1345,27 +1333,7 @@ static void render(struct display_output *output) {
                 cflp_info("Created shader program %u", shader_program);
         }
         
-        // Create VAO and VBO if needed
-        if (vao == 0) {
-            glGenVertexArrays(1, &vao);
-            glGenBuffers(1, &vbo);
-            
-            glBindVertexArray(vao);
-            glBindBuffer(GL_ARRAY_BUFFER, vbo);
-            
-            // Position attribute
-            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
-            glEnableVertexAttribArray(0);
-            
-            // Texture coordinate attribute
-            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
-            glEnableVertexAttribArray(1);
-            
-            glBindVertexArray(0);
-            
-            if (VERBOSE)  // Keep this as it's a one-time message
-                cflp_info("Created VAO %u and VBO %u", vao, vbo);
-        }
+        ensure_quad_buffers();
         
         // Update vertex data based on current video dimensions and scaling options
         update_vertex_data(output);
@@ -1399,6 +1367,143 @@ static void render(struct display_output *output) {
         if (VERBOSE)
             cflp_info("No video texture available for rendering");
     }
+}
+
+// Deletes the textures of slots that are no longer drawn.
+static void prune_slide_textures(const slideshow_layer *layers, size_t count) {
+    for (size_t i = 0; i < sizeof(slide_textures) / sizeof(slide_textures[0]); i++) {
+        slide_texture *entry = &slide_textures[i];
+        bool in_use = false;
+        for (size_t j = 0; j < count; j++)
+            in_use |= entry->texture != 0 && entry->slot_id == media_slot_id(layers[j].slot);
+        if (entry->texture != 0 && !in_use) {
+            glDeleteTextures(1, &entry->texture);
+            *entry = (slide_texture){0};
+        }
+    }
+}
+
+// The texture for a slot, created on first use. Pruning first guarantees
+// a free entry, since at most two slots are drawn at once.
+static slide_texture *slide_texture_for(const media_slot *slot) {
+    slide_texture *unused = NULL;
+    for (size_t i = 0; i < sizeof(slide_textures) / sizeof(slide_textures[0]); i++) {
+        slide_texture *entry = &slide_textures[i];
+        if (entry->texture != 0 && entry->slot_id == media_slot_id(slot))
+            return entry;
+        if (entry->texture == 0 && !unused)
+            unused = entry;
+    }
+    if (!unused)
+        return NULL;
+    *unused = (slide_texture){.slot_id = media_slot_id(slot)};
+    glGenTextures(1, &unused->texture);
+    glBindTexture(GL_TEXTURE_2D, unused->texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return unused;
+}
+
+// Uploads the slot's newest frame, if it has one the texture lacks.
+static void upload_slide_frame(slide_texture *entry, media_slot *slot) {
+    int width, height;
+    GstBuffer *frame = media_slot_take_frame(slot, &width, &height);
+    if (!frame)
+        return;
+    GstMapInfo map;
+    if (gst_buffer_map(frame, &map, GST_MAP_READ)) {
+        if (width != entry->width || height != entry->height) {
+            glBindTexture(GL_TEXTURE_2D, entry->texture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            entry->width = width;
+            entry->height = height;
+        }
+        upload_frame_to_texture(entry->texture, map.data, (gsize)width * height * 4, width, height);
+        gst_buffer_unmap(frame, &map);
+    }
+    gst_buffer_unref(frame);
+}
+
+// Draws the slideshow's layers. Each one is added onto the cleared black
+// background scaled by its opacity, so a crossfade shows
+// old * (1 - p) + new * p, and letterbox bars fade along with the picture.
+// Destination alpha is left at the cleared 1.0 so the surface stays opaque.
+static void draw_slideshow(struct display_output *output) {
+    slideshow_layer layers[2];
+    size_t count = slideshow_layers(slideshow_instance, g_get_monotonic_time(), layers);
+    prune_slide_textures(layers, count);
+    if (count == 0)
+        return;
+
+    if (layer_shader_program == 0 && (layer_shader_program = create_layer_shader_program()) == 0)
+        return;
+    ensure_quad_buffers();
+
+    glUseProgram(layer_shader_program);
+    glActiveTexture(GL_TEXTURE0);
+    glUniform1i(glGetUniformLocation(layer_shader_program, "layerTexture"), 0);
+    GLint opacity_location = glGetUniformLocation(layer_shader_program, "opacity");
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ZERO, GL_ONE);
+
+    for (size_t i = 0; i < count; i++) {
+        slide_texture *entry = slide_texture_for(layers[i].slot);
+        if (!entry)
+            continue;
+        upload_slide_frame(entry, layers[i].slot);
+        if (entry->width == 0)
+            continue; // no frame yet
+        set_quad_for_dimensions(output, entry->width, entry->height);
+        glBindTexture(GL_TEXTURE_2D, entry->texture);
+        glUniform1f(opacity_location, layers[i].opacity);
+        glBindVertexArray(vao);
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+        glBindVertexArray(0);
+    }
+
+    glDisable(GL_BLEND);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(0);
+}
+
+static void render(struct display_output *output) {
+    // If using waylandsink, we don't need EGL rendering - waylandsink handles it
+    if (using_waylandsink) {
+        // Just schedule the next frame callback
+        output->frame_callback = wl_surface_frame(output->surface);
+        wl_callback_add_listener(output->frame_callback, &wl_surface_frame_listener, output);
+        output->redraw_needed = false;
+        return;
+    }
+
+    // For image mode, only render once unless redraw explicitly needed or transitioning
+    if (is_image_mode && !output->redraw_needed && texture_manager.initialized && !transition_state.active) {
+        return;  // Image already rendered, no continuous updates needed
+    }
+
+    // Make sure we have a valid context
+    if (!eglMakeCurrent(egl_display, output->egl_surface, output->egl_surface, egl_context)) {
+        cflp_error("Failed to make output surface current");
+        return;
+    }
+
+    glViewport(0, 0, output->width * output->scale, output->height * output->scale);
+    
+    // Clear with black background
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    // Update transition progress if active
+    update_transition();
+
+    if (slideshow_instance)
+        draw_slideshow(output);
+    else
+        draw_video_frame(output);
 
     // Display frame first (must be done before creating frame callback)
     if (!eglSwapBuffers(egl_display, output->egl_surface))
@@ -1407,7 +1512,7 @@ static void render(struct display_output *output) {
     // Create frame callback for next frame
     // During transitions, we always want a callback to ensure continuous rendering
     // For normal rendering, we only create callback if redraw is needed
-    if (transition_state.active || output->redraw_needed) {
+    if (continuous_render_needed() || output->redraw_needed) {
         // Destroy any existing callback first (shouldn't happen, but be safe)
         if (output->frame_callback) {
             wl_callback_destroy(output->frame_callback);
@@ -1418,7 +1523,7 @@ static void render(struct display_output *output) {
         wl_callback_add_listener(output->frame_callback, &wl_surface_frame_listener, output);
         
         // During transitions, keep redraw_needed true to ensure continuous rendering
-        if (transition_state.active) {
+        if (continuous_render_needed()) {
             output->redraw_needed = true;
         } else {
             output->redraw_needed = false;
@@ -1460,7 +1565,7 @@ static void frame_handle_done(void *data, struct wl_callback *callback, uint32_t
     // Always render if transition is active or redraw is needed
     // During transitions, this creates a continuous render loop:
     // render() -> frame_callback -> frame_handle_done() -> render() -> ...
-    if (transition_state.active || output->redraw_needed) {
+    if (continuous_render_needed() || output->redraw_needed) {
         if (VERBOSE == 2)
             cflp_info("%s frame callback: rendering next frame", output->name);
         render(output);
@@ -2157,18 +2262,8 @@ static gboolean bus_callback(GstBus *bus, GstMessage *msg, gpointer data) {
 
 static void *handle_gst_events(void *_) {
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-    time_t start_time = time(NULL);
 
     while (true) {
-        if (SLIDESHOW_TIME) {
-            if ((time(NULL) - start_time) >= SLIDESHOW_TIME) {
-                // For slideshow mode, we would need to implement playlist handling
-                // This is a placeholder
-                cflp_info("Slideshow next (not implemented)");
-                start_time = time(NULL);
-            }
-        }
-
         // Handle GStreamer messages
         // CHANGED 2026-09-30 - Stop touching the bus once shutdown starts - Problem:
         // with teardown deferred to the main thread, exit_cleanup unrefs the bus
@@ -2266,13 +2361,15 @@ static void execute_ipc_commands(void) {
         else if (strcmp(cmd_name, "query") == 0) {
             char response[512];
             const char *state = (halt_info.is_paused > 0) ? "paused" : "playing";
-            const char *mode = is_image_mode ? "image" : "video";
+            const char *mode = slideshow_instance ? "slideshow" : is_image_mode ? "image" : "video";
             const char *path = video_path ? video_path : "unknown";
             snprintf(response, sizeof(response), "STATUS: %s %s %s\n", state, mode, path);
             ipc_send_response(cmd->client_fd, response);
         }
         else if (strcmp(cmd_name, "change") == 0) {
-            if (!arg || strlen(arg) == 0) {
+            if (slideshow_instance) {
+                ipc_send_response(cmd->client_fd, "ERROR: change is not available during a slideshow\n");
+            } else if (!arg || strlen(arg) == 0) {
                 ipc_send_response(cmd->client_fd, "ERROR: missing path argument\n");
             } else if (strlen(arg) >= PATH_MAX) {
                 ipc_send_response(cmd->client_fd, "ERROR: path too long\n");
@@ -2563,6 +2660,49 @@ static void execute_ipc_commands(void) {
     }
 }
 
+// Starts the folder slideshow for video_path. Items appear once the first
+// one has loaded (see advance_slideshow()).
+static void start_slideshow(void) {
+    gst_init(NULL, NULL);
+    bool fade = transition_state.enabled && transition_state.type == TRANSITION_FADE;
+    double interval = SLIDESHOW_TIME ? SLIDESHOW_TIME : SLIDESHOW_DEFAULT_INTERVAL_SECS;
+    slideshow_instance = slideshow_new((slideshow_config){
+        .directory = video_path,
+        .interval_secs = interval,
+        .fade_secs = fade ? transition_state.duration : 0,
+        .preload_limit_bytes = preload_limit_mb * 1024 * 1024,
+        .audio = !audio_disabled(),
+        .wakeup_fd = wakeup_pipe[1],
+        .verbose = VERBOSE,
+    });
+    if (!slideshow_instance) {
+        cflp_error("Failed to start the slideshow");
+        exit_slapper(EXIT_FAILURE);
+    }
+    if (VERBOSE)
+        cflp_info("Slideshow of %s: %.0f s per item, %s", video_path, interval,
+                  fade ? "crossfading" : "cutting (use --transition-type fade to crossfade)");
+}
+
+// Advances the slideshow's schedule. Called from the main loop.
+static void advance_slideshow(void) {
+    bool changed = slideshow_tick(slideshow_instance, g_get_monotonic_time(), halt_info.is_paused > 0);
+
+    // Keep `pipeline` referencing the item on screen
+    GstElement *current = slideshow_current_pipeline(slideshow_instance);
+    if (current != pipeline) {
+        bool first_item = pipeline == NULL;
+        if (pipeline)
+            gst_object_unref(pipeline);
+        pipeline = current ? gst_object_ref(current) : NULL;
+        if (first_item && current)
+            notify_systemd_ready();
+    }
+
+    if (changed && write(wakeup_pipe[1], "r", 1) == -1 && errno != EAGAIN)
+        cflp_warning("Failed to write to wakeup pipe");
+}
+
 static void init_threads() {
     uint id = 0;
 
@@ -2672,12 +2812,16 @@ static void apply_scaling_options() {
     }
 }
 
+static bool audio_disabled(void) {
+    return strstr(gst_options, "no-audio") != NULL || strstr(gst_options, "mute") != NULL;
+}
+
 static void apply_gst_options() {
     if (VERBOSE)
         cflp_info("Applying GStreamer options: %s", gst_options);
 
     // Parse gst_options and apply them to the pipeline
-    if (strstr(gst_options, "no-audio") != NULL || strstr(gst_options, "mute") != NULL) {
+    if (audio_disabled()) {
         // Disable audio by setting flags
         gint flags = 0x00000001; // GST_PLAY_FLAG_VIDEO only
         g_object_set(G_OBJECT(pipeline), "flags", flags, NULL);
@@ -2696,32 +2840,8 @@ static void apply_gst_options() {
 
 }
 
-// Known image extensions for fast-path detection
-static const char *image_extensions[] = {
-    ".jpg", ".jpeg", ".png", ".webp", ".gif", NULL
-};
-
 static bool is_image_file(const char *path) {
-    if (!path) return false;
-
-    // Get file extension (find last dot)
-    const char *ext = strrchr(path, '.');
-    if (!ext) return false;
-
-    // Convert to lowercase for comparison
-    char ext_lower[16] = {0};
-    for (int i = 0; ext[i] && i < 15; i++) {
-        ext_lower[i] = (ext[i] >= 'A' && ext[i] <= 'Z') ? ext[i] + 32 : ext[i];
-    }
-
-    // Check against known image extensions
-    for (int i = 0; image_extensions[i]; i++) {
-        if (strcmp(ext_lower, image_extensions[i]) == 0) {
-            return true;
-        }
-    }
-
-    return false;
+    return media_is_image_name(path);
 }
 
 // CHANGED 2026-07-20 - Route GIF through gdkpixbufdec - Problem: decodebin picks decoders by matching
@@ -3789,11 +3909,12 @@ static void parse_command_line(int argc, char **argv, struct wl_state *state) {
         {"no-save-state", no_argument, NULL, 1002},
         {"cache-size", required_argument, NULL, 1003},
         {"niri", no_argument, NULL, 1004},
+        {"preload-limit", required_argument, NULL, 1005},
         {0, 0, 0, 0}
     };
 
     const char *usage =
-        "Usage: slapper [options] <output> <url|path filename>\n"
+        "Usage: slapper [options] <output> <url|path filename|folder>\n"
         "       slapper --restore [output]\n"
         "\n"
         "Example: slapper -vs -o \"no-audio loop\" DP-2 /path/to/video\n"
@@ -3805,7 +3926,7 @@ static void parse_command_line(int argc, char **argv, struct wl_state *state) {
         "--fork         -f              Forks slapper so you can close the terminal\n"
         "--auto-pause   -p              Pause playback when wallpaper is hidden (saves CPU)\n"
         "--auto-stop    -s              Stop and restart when hidden (required for video IPC changes)\n"
-        "--slideshow    -n SECS         Slideshow mode plays the next video in a playlist every ? seconds\n"
+        "--slideshow    -n SECS         With a folder as the path, show each image/video for SECS (default 300)\n"
         "--layer        -l LAYER        Specifies shell surface layer to run on (background by default)\n"
         "--gst-options  -o \"OPTIONS\"    Forwards GStreamer options (Must be within quotes\"\")\n"
         "--fps-cap      -r FPS           Frame rate cap (30, 60, or 100 FPS, default: 30)\n"
@@ -3819,6 +3940,7 @@ static void parse_command_line(int argc, char **argv, struct wl_state *state) {
         "--no-save-state                Disable automatic state saving on exit\n"
         "--cache-size MB                 Image cache size in MB (default: 256, 0 to disable)\n"
         "--niri                         Pause playback while a fullscreen window is focused in niri\n"
+        "--preload-limit MB             Slideshow: largest file loaded into RAM ahead of its turn (default 512, 0 to stream)\n"
         "\n"
         "Scaling modes (use with -o):\n"
         "  fill        Fill screen maintaining aspect ratio, crop excess (default for images)\n"
@@ -3965,6 +4087,16 @@ static void parse_command_line(int argc, char **argv, struct wl_state *state) {
             case 1004: // --niri
                 niri_enabled = true;
                 break;
+            case 1005: // --preload-limit
+                {
+                    int limit = atoi(optarg);
+                    if (limit < 0) {
+                        cflp_warning("Invalid preload limit %d, using default %zu MB", limit, preload_limit_mb);
+                    } else {
+                        preload_limit_mb = (size_t)limit;
+                    }
+                }
+                break;
         }
     }
 
@@ -4102,12 +4234,19 @@ int main(int argc, char **argv) {
         if (VERBOSE)
             cflp_success("EGL initialized");
 
-        // Detect if input is a static image or video. GIFs count as video
-        // when a GIF video decoder is available so they play animated.
-        is_image_mode = is_static_image_path(video_path);
-        video_is_gif = !is_image_mode && is_gif_file(video_path);
+        // A folder plays as a slideshow; otherwise detect if input is a static
+        // image or video. GIFs count as video when a GIF video decoder is
+        // available so they play animated.
+        struct stat path_stat;
+        bool slideshow_mode = stat(video_path, &path_stat) == 0 && S_ISDIR(path_stat.st_mode);
+        is_image_mode = !slideshow_mode && is_static_image_path(video_path);
+        video_is_gif = !slideshow_mode && !is_image_mode && is_gif_file(video_path);
+        if (SLIDESHOW_TIME && !slideshow_mode)
+            cflp_warning("--slideshow needs a folder as the wallpaper path; showing %s on its own", video_path);
 
-        if (is_image_mode) {
+        if (slideshow_mode) {
+            start_slideshow();
+        } else if (is_image_mode) {
             // Default to fill mode for images only when no scaling mode was requested.
             if (!scaling_mode_explicit) {
                 fill_mode = true;
@@ -4184,7 +4323,7 @@ int main(int argc, char **argv) {
 
         // Wait for a GStreamer callback, IPC command, or wl_display event
         int nfds = ipc_socket_path ? 3 : 2;
-        int poll_timeout = transition_state.active ? 16 : 50;  // Faster polling during transitions
+        int poll_timeout = continuous_render_needed() ? 16 : 50;  // Faster polling during transitions
         int poll_result = poll(fds, nfds, poll_timeout);
         if (poll_result == -1 && errno != EINTR)
             break;
@@ -4200,6 +4339,9 @@ int main(int argc, char **argv) {
 
         // Apply the latest --niri fullscreen decision (see niri_pause_changed()).
         process_niri_pause();
+
+        if (slideshow_instance)
+            advance_slideshow();
 
 
         // If wl_display_prepare_read() was successful as 0
@@ -4257,7 +4399,7 @@ int main(int argc, char **argv) {
         
         // During transitions, force continuous rendering
         // We can't rely on frame callbacks for smooth transitions
-        if (transition_state.active) {
+        if (continuous_render_needed()) {
             struct display_output *output;
             wl_list_for_each(output, &state.outputs, link) {
                 if (output->egl_window && output->egl_surface) {

@@ -80,6 +80,37 @@ gslapper -r 60 -o "loop" DP-1 video.mp4
 
 **Use Case**: Higher FPS for smoother video playback, lower FPS to reduce CPU/GPU usage.
 
+## Slideshow Options
+
+Pass a folder instead of a file to rotate through every image and video in it:
+
+```bash
+gslapper -n 300 --transition-type fade --transition-duration 2 -o "fill no-audio" DP-1 ~/Wallpapers
+```
+
+Items play in natural file-name order (`clip2` before `clip10`) and the order wraps around at the end. Videos shorter than their turn loop; longer ones are cut off by the next crossfade. The `-o` scaling mode applies to every item, so `fill` is usually what you want for a folder that mixes images and videos.
+
+The folder is read again before every switch, so you can add, rename or delete files while gSlapper runs. A file is picked up once it has stopped changing for a few seconds (so a copy in progress is not shown half-written), and a file that cannot be played is skipped. Pausing, by IPC, `--auto-pause` or `--niri`, also stops the clock, so items do not rotate while the wallpaper is paused.
+
+### `-n, --slideshow SECS`
+
+How long each item stays on screen, measured from one switch to the next. Only used when the wallpaper path is a folder.
+
+**Default:** 300 seconds
+
+Crossfades use the transition options: with `--transition-type fade` the switch fades over `--transition-duration` seconds (audio fades along with it); without it the switch is a cut.
+
+### `--preload-limit MB`
+
+About 15 seconds before an item's turn, gSlapper copies the file into memory and decodes its first frame, so the switch never waits on the disk or the decoder. Files larger than this limit are streamed from disk instead, after asking the kernel to start caching them. At most two items are held in memory at once: the one playing and the one coming next.
+
+```bash
+gslapper --preload-limit 1024 -n 600 DP-1 ~/Wallpapers   # allow files up to 1 GB
+gslapper --preload-limit 0 -n 600 DP-1 ~/Wallpapers      # always stream
+```
+
+**Default:** 512 MB
+
 ## Display Options
 
 ### `-l, --layer LAYER`

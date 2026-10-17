@@ -75,12 +75,20 @@ Transitions work with all supported image formats:
 
 ## Limitations
 
-- Transitions only work between static images
-- Video wallpapers do not support transitions
+- IPC `change` transitions only work between static images
+- Video wallpapers only crossfade in folder slideshows
 - IPC socket must be enabled
 - Rapid transitions (multiple changes in quick succession) may cancel previous transitions
 
 ## Examples
+
+### Folder Slideshow
+
+gSlapper can rotate through a folder by itself, crossfading between images and videos alike; see [Slideshow Options](../user-guide/command-line-options#slideshow-options):
+
+```bash
+gslapper -n 300 --transition-type fade --transition-duration 2 -o "fill no-audio" DP-1 ~/Wallpapers
+```
 
 ### Slideshow Script
 

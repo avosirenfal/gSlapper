@@ -786,7 +786,9 @@ static struct {
 | `-d` | `--help-output` | flag | Display all available outputs and quit |
 | `-p` | `--auto-pause` | flag | Auto-pause when wallpaper hidden |
 | `-s` | `--auto-stop` | flag | Auto-stop when wallpaper hidden |
-| `-n` | `--slideshow` | seconds | Slideshow mode (TODO: not fully implemented) |
+| `-n` | `--slideshow` | seconds | Seconds per item when the path is a folder (default: 300) |
+| | `--preload-limit` | MB | Slideshow: largest file loaded into RAM before its turn (default: 512, 0 to stream) |
+| | `--niri` | flag | Pause while a fullscreen window is focused in niri |
 | `-l` | `--layer` | string | Shell surface layer (background, bottom, top, overlay) |
 | `-o` | `--gst-options` | string | GStreamer options (see below) |
 | `-r` | `--fps-cap` | int | Frame rate cap (30, 60, or 100 FPS) |

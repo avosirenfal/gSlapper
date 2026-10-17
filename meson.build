@@ -36,7 +36,7 @@ protocols_headers=[
 lib_protocols=static_library('protocols',protocols_src+protocols_headers,dependencies: wl_client)
 protocols_dep=declare_dependency(link_with: lib_protocols,sources: protocols_headers)
 
-executable(meson.project_name(), ['src/main.c', 'src/output_metadata.c', 'src/process_utils.c', 'src/glad.c', 'src/cflogprinter.c', 'src/ipc.c', 'src/state.c', 'src/cache.c', 'src/json.c', 'src/niri.c'],
+executable(meson.project_name(), ['src/main.c', 'src/output_metadata.c', 'src/process_utils.c', 'src/glad.c', 'src/cflogprinter.c', 'src/ipc.c', 'src/state.c', 'src/cache.c', 'src/json.c', 'src/niri.c', 'src/playlist.c', 'src/slideshow.c'],
 include_directories : ['inc'],
 dependencies: [dl_dep, wl_client, wl_egl, egl, gst_dep, gst_video_dep, gst_gl_dep, threads, protocols_dep, systemd_dep], install: true)
 
@@ -64,7 +64,8 @@ test('ipc-socket', test_ipc_socket, env: ['ASAN_OPTIONS=detect_leaks=0'])
 
 test_watch_list = executable('test-watch-list',
   ['tests/test_watch_list.c', 'src/glad.c', 'src/cflogprinter.c', 'src/ipc.c', 'src/state.c',
-   'src/cache.c', 'src/output_metadata.c', 'src/process_utils.c', 'src/json.c', 'src/niri.c'],
+   'src/cache.c', 'src/output_metadata.c', 'src/process_utils.c', 'src/json.c', 'src/niri.c',
+   'src/playlist.c', 'src/slideshow.c'],
   include_directories: ['inc'],
   dependencies: [dl_dep, wl_client, wl_egl, egl, gst_dep, gst_video_dep, gst_gl_dep, threads, protocols_dep, systemd_dep],
   build_by_default: false)
@@ -78,3 +79,12 @@ test_niri_state = executable('test-niri-state',
   link_args: ['-fsanitize=address,undefined'],
   build_by_default: false)
 test('niri-state', test_niri_state)
+
+test_slideshow = executable('test-slideshow',
+  ['tests/test_slideshow.c', 'src/slideshow.c', 'src/playlist.c', 'src/cflogprinter.c'],
+  include_directories: ['inc'],
+  dependencies: [gst_dep, gst_video_dep, threads],
+  c_args: ['-fsanitize=address,undefined'],
+  link_args: ['-fsanitize=address,undefined'],
+  build_by_default: false)
+test('slideshow', test_slideshow, env: ['ASAN_OPTIONS=detect_leaks=0'], timeout: 60)
