@@ -35,4 +35,12 @@ typedef bool (*playlist_skip_fn)(const char *name, void *userdata);
 char *playlist_next(const char *directory, const char *after, time_t now,
                     playlist_skip_fn skip, void *userdata);
 
+// Returns a uniformly random integer in [0, bound); bound is at least 1.
+typedef unsigned (*playlist_random_fn)(unsigned bound, void *userdata);
+
+// Returns a random candidate, chosen uniformly among the files playlist_next
+// would consider (same rules, same `skip`), or NULL when there are none.
+char *playlist_random(const char *directory, time_t now, playlist_skip_fn skip, void *skip_data,
+                      playlist_random_fn random, void *random_data);
+
 #endif // PLAYLIST_H

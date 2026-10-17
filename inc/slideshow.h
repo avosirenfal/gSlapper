@@ -22,6 +22,7 @@ typedef struct {
     double fade_secs;           // crossfade length; 0 cuts directly
     size_t preload_limit_bytes; // larger files stream from disk instead of RAM
     bool audio;
+    bool shuffle;               // random order, each file once per round
     int wakeup_fd;              // written to when a slot has a new frame
     int verbose;
 } slideshow_config;

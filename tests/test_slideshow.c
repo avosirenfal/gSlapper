@@ -196,6 +196,70 @@ static void run_for(slideshow *show, int wakeup_fd, double secs, bool paused, ru
     }
 }
 
+static unsigned glib_random_below(unsigned bound, void *userdata) {
+    (void)userdata;
+    return (unsigned)g_random_int_range(0, (gint32)bound);
+}
+
+static void test_playlist_random(void) {
+    // a.webm, b.png and d.webm exist; b.png is skipped
+    int counts[3] = {0};
+    const char *names[3] = {"a.webm", "b.png", "d.webm"};
+    for (int i = 0; i < 300; i++) {
+        char *name = playlist_random(dir, time(NULL), skip_b, NULL, glib_random_below, NULL);
+        for (int j = 0; j < 3; j++)
+            counts[j] += name && strcmp(name, names[j]) == 0;
+        free(name);
+    }
+    // Each of the two candidates is drawn about 150 times
+    CHECK(counts[0] > 100 && counts[2] > 100 && counts[1] == 0);
+    CHECK(playlist_random("/nonexistent/folder", time(NULL), NULL, NULL, glib_random_below, NULL) == NULL);
+}
+
+static void test_shuffle(void) {
+    int wakeup[2];
+    CHECK(pipe2(wakeup, O_NONBLOCK | O_CLOEXEC) == 0);
+    write_file("c_broken.mp4", "this is not a video");
+    settle("c_broken.mp4");
+
+    slideshow *show = slideshow_new((slideshow_config){
+        .directory = dir,
+        .interval_secs = 0.5,
+        .fade_secs = 0.1,
+        .preload_limit_bytes = 64 * 1024 * 1024,
+        .shuffle = true,
+        .wakeup_fd = wakeup[1],
+    });
+    run_log log = {0};
+    run_for(show, wakeup[0], 6.0, false, &log);
+    slideshow_free(show);
+
+    // Rounds of the three playable files, each a permutation, never the
+    // broken file, and no item twice in a row across round boundaries
+    CHECK(log.shown_count >= 6);
+    for (size_t round = 0; round + 3 <= log.shown_count && round < 6; round += 3) {
+        bool seen[3] = {false};
+        const char *names[3] = {"a.webm", "b.png", "d.webm"};
+        for (size_t i = round; i < round + 3; i++) {
+            for (int j = 0; j < 3; j++)
+                seen[j] |= strcmp(log.shown[i], names[j]) == 0;
+        }
+        if (!(seen[0] && seen[1] && seen[2])) {
+            fprintf(stderr, "round at %zu is not a permutation: %s %s %s\n", round, log.shown[round],
+                    log.shown[round + 1], log.shown[round + 2]);
+            failures++;
+        }
+    }
+    for (size_t i = 0; i < log.shown_count; i++)
+        CHECK(strcmp(log.shown[i], "c_broken.mp4") != 0);
+
+    char *broken = path_in("c_broken.mp4");
+    unlink(broken);
+    g_free(broken);
+    close(wakeup[0]);
+    close(wakeup[1]);
+}
+
 static void test_rotation(void) {
     int wakeup[2];
     CHECK(pipe2(wakeup, O_NONBLOCK | O_CLOEXEC) == 0);
@@ -274,6 +338,8 @@ int main(void) {
     }
 
     test_playlist();
+    test_playlist_random();
+    test_shuffle();
     test_rotation();
 
     char *cmd = g_strdup_printf("rm -rf '%s'", dir);

@@ -75,6 +75,12 @@ struct media_slot {
     int caps_width, caps_height;
 };
 
+// A small set of file names; folders hold few enough files for a list.
+typedef struct {
+    char **names;
+    size_t count;
+} name_set;
+
 struct slideshow {
     slideshow_config config;
     media_slot *current; // on screen; NULL until the first item is ready
@@ -85,8 +91,8 @@ struct slideshow {
     int64_t last_tick_us;
     bool paused;
     int64_t retry_at_us;
-    char **failed; // names that failed since the last successful switch
-    size_t failed_count;
+    name_set failed; // names that failed since the last successful switch
+    name_set played; // with shuffle: names shown in the current round
     uint64_t next_slot_id;
     bool warned_empty;
 };
@@ -497,34 +503,71 @@ GstBuffer *media_slot_take_frame(media_slot *slot, int *width, int *height) {
 
 // ==== Scheduler ====
 
-static bool name_failed(const char *name, void *userdata) {
-    const slideshow *show = userdata;
-    for (size_t i = 0; i < show->failed_count; i++) {
-        if (strcmp(show->failed[i], name) == 0)
+static bool name_set_contains(const name_set *set, const char *name) {
+    for (size_t i = 0; i < set->count; i++) {
+        if (strcmp(set->names[i], name) == 0)
             return true;
     }
     return false;
 }
 
-static void remember_failure(slideshow *show, const char *name) {
-    char **failed = realloc(show->failed, (show->failed_count + 1) * sizeof(*failed));
-    char *copy = strdup(name);
-    if (!failed || !copy) {
-        free(copy);
-        if (failed)
-            show->failed = failed;
+static void name_set_add(name_set *set, const char *name) {
+    if (name_set_contains(set, name))
         return;
-    }
-    show->failed = failed;
-    show->failed[show->failed_count++] = copy;
+    char **names = realloc(set->names, (set->count + 1) * sizeof(*names));
+    if (!names)
+        return;
+    set->names = names;
+    if ((set->names[set->count] = strdup(name)) != NULL)
+        set->count++;
+}
+
+static void name_set_clear(name_set *set) {
+    for (size_t i = 0; i < set->count; i++)
+        free(set->names[i]);
+    free(set->names);
+    *set = (name_set){0};
 }
 
 static void forget_failures(slideshow *show) {
-    for (size_t i = 0; i < show->failed_count; i++)
-        free(show->failed[i]);
-    free(show->failed);
-    show->failed = NULL;
-    show->failed_count = 0;
+    name_set_clear(&show->failed);
+}
+
+static bool skip_failed(const char *name, void *userdata) {
+    const slideshow *show = userdata;
+    return name_set_contains(&show->failed, name);
+}
+
+// Shuffle draws only files not yet shown this round, and never the current
+// one, so nothing repeats back to back when a new round starts
+static bool skip_for_shuffle(const char *name, void *userdata) {
+    const slideshow *show = userdata;
+    return skip_failed(name, userdata) || name_set_contains(&show->played, name) ||
+           (show->current && strcmp(show->current->name, name) == 0);
+}
+
+static unsigned random_below(unsigned bound, void *userdata) {
+    (void)userdata;
+    return (unsigned)g_random_int_range(0, (gint32)bound);
+}
+
+// The name of the item to show after the current one.
+static char *pick_next_name(slideshow *show) {
+    const char *directory = show->config.directory;
+    time_t now = time(NULL);
+    if (show->config.shuffle) {
+        char *name = playlist_random(directory, now, skip_for_shuffle, show, random_below, NULL);
+        if (!name && show->played.count > 0) {
+            // Everything has been shown this round: start the next one
+            name_set_clear(&show->played);
+            name = playlist_random(directory, now, skip_for_shuffle, show, random_below, NULL);
+        }
+        if (name)
+            return name;
+        // Only the current item is left; the sequential pick below returns
+        // it so that it keeps looping
+    }
+    return playlist_next(directory, show->current ? show->current->name : NULL, now, skip_failed, show);
 }
 
 static double fade_progress(const slideshow *show, double elapsed) {
@@ -543,6 +586,8 @@ static void finish_switch(slideshow *show) {
     show->fading = false;
     slot_set_volume(show->current, 1.0);
     forget_failures(show);
+    if (show->config.shuffle)
+        name_set_add(&show->played, show->current->name);
     if (show->config.verbose)
         cflp_info("Slideshow: showing %s", show->current->name);
 }
@@ -559,8 +604,7 @@ static void begin_switch(slideshow *show) {
 
 // Picks the item after the current one and starts loading it.
 static void choose_next(slideshow *show, int64_t now_us, bool current_usable) {
-    char *name = playlist_next(show->config.directory, show->current ? show->current->name : NULL,
-                               time(NULL), name_failed, show);
+    char *name = pick_next_name(show);
     if (!name) {
         if (!show->warned_empty)
             cflp_warning("Slideshow: no playable images or videos in %s, checking again shortly",
@@ -609,6 +653,7 @@ void slideshow_free(slideshow *show) {
     for (int waited_ms = 0; atomic_load(&teardowns_in_flight) > 0 && waited_ms < 5000; waited_ms += 10)
         g_usleep(10000);
     forget_failures(show);
+    name_set_clear(&show->played);
     free((char *)show->config.directory);
     free(show);
 }
@@ -634,7 +679,7 @@ bool slideshow_tick(slideshow *show, int64_t now_us, bool paused) {
     // An incoming item that failed is dropped (mid-fade the outgoing one
     // simply stays), and another one is tried
     if (show->next && slot_get_status(show->next) == SLOT_FAILED) {
-        remember_failure(show, show->next->name);
+        name_set_add(&show->failed, show->next->name);
         slot_release(show->next);
         show->next = NULL;
         changed |= show->fading;

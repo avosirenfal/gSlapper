@@ -212,6 +212,7 @@ static bool niri_paused = false;
 #define SLIDESHOW_DEFAULT_INTERVAL_SECS 300
 static slideshow *slideshow_instance = NULL;
 static size_t preload_limit_mb = 512;
+static bool slideshow_shuffle = false;
 
 // Texture holding a slideshow slot's latest frame, matched to it by id
 typedef struct {
@@ -2714,6 +2715,7 @@ static void start_slideshow(void) {
         .fade_secs = fade ? transition_state.duration : 0,
         .preload_limit_bytes = preload_limit_mb * 1024 * 1024,
         .audio = !audio_disabled(),
+        .shuffle = slideshow_shuffle,
         .wakeup_fd = wakeup_pipe[1],
         .verbose = VERBOSE,
     });
@@ -2722,7 +2724,8 @@ static void start_slideshow(void) {
         exit_slapper(EXIT_FAILURE);
     }
     if (VERBOSE)
-        cflp_info("Slideshow of %s: %.0f s per item, %s", video_path, interval,
+        cflp_info("Slideshow of %s: %.0f s per item, %s, %s", video_path, interval,
+                  slideshow_shuffle ? "shuffled" : "in name order",
                   fade ? "crossfading" : "cutting (use --transition-type fade to crossfade)");
 }
 
@@ -3952,6 +3955,7 @@ static void parse_command_line(int argc, char **argv, struct wl_state *state) {
         {"cache-size", required_argument, NULL, 1003},
         {"niri", no_argument, NULL, 1004},
         {"preload-limit", required_argument, NULL, 1005},
+        {"shuffle", no_argument, NULL, 1006},
         {0, 0, 0, 0}
     };
 
@@ -3983,6 +3987,7 @@ static void parse_command_line(int argc, char **argv, struct wl_state *state) {
         "--cache-size MB                 Image cache size in MB (default: 256, 0 to disable)\n"
         "--niri                         Pause playback while a fullscreen window is focused in niri\n"
         "--preload-limit MB             Slideshow: largest file loaded into RAM ahead of its turn (default 512, 0 to stream)\n"
+        "--shuffle                      Slideshow: random order, every file once per round\n"
         "\n"
         "Scaling modes (use with -o):\n"
         "  fill        Fill screen maintaining aspect ratio, crop excess (default for images)\n"
@@ -4139,6 +4144,9 @@ static void parse_command_line(int argc, char **argv, struct wl_state *state) {
                     }
                 }
                 break;
+            case 1006: // --shuffle
+                slideshow_shuffle = true;
+                break;
         }
     }
 
@@ -4286,8 +4294,9 @@ int main(int argc, char **argv) {
         bool slideshow_mode = stat(video_path, &path_stat) == 0 && S_ISDIR(path_stat.st_mode);
         is_image_mode = !slideshow_mode && is_static_image_path(video_path);
         video_is_gif = !slideshow_mode && !is_image_mode && is_gif_file(video_path);
-        if (SLIDESHOW_TIME && !slideshow_mode)
-            cflp_warning("--slideshow needs a folder as the wallpaper path; showing %s on its own", video_path);
+        if ((SLIDESHOW_TIME || slideshow_shuffle) && !slideshow_mode)
+            cflp_warning("--slideshow and --shuffle need a folder as the wallpaper path; showing %s on its own",
+                         video_path);
 
         if (slideshow_mode) {
             start_slideshow();

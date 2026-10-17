@@ -788,6 +788,7 @@ static struct {
 | `-s` | `--auto-stop` | flag | Auto-stop when wallpaper hidden |
 | `-n` | `--slideshow` | seconds | Seconds per item when the path is a folder (default: 300) |
 | | `--preload-limit` | MB | Slideshow: largest file loaded into RAM before its turn (default: 512, 0 to stream) |
+| | `--shuffle` | flag | Slideshow: random order, every file once per round |
 | | `--niri` | flag | Pause while a fullscreen window is focused in niri |
 | `-l` | `--layer` | string | Shell surface layer (background, bottom, top, overlay) |
 | `-o` | `--gst-options` | string | GStreamer options (see below) |
