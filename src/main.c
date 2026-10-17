@@ -288,9 +288,8 @@ static struct {
 
     int is_paused;
     bool frame_ready;
-    bool stop_render_loop;
 
-} halt_info = {NULL, NULL, 0, NULL, NULL, 0, 0, 0, 0, 0};
+} halt_info = {0};
 
 // gst events, auto-pause/stop, pauselist, stoplist, niri, plus the 0 terminator
 static pthread_t threads[6] = {0};
@@ -331,6 +330,7 @@ static void notify_systemd_ready(void);
 static void notify_systemd_stopping(void);
 static bool is_all_outputs_selector(const char *monitor);
 static bool audio_disabled(void);
+static void destroy_display_output(struct display_output *output);
 
 // Cleanup function
 static void exit_cleanup() {
@@ -353,20 +353,27 @@ static void exit_cleanup() {
         ipc_shutdown();
     }
 
-    // Give GStreamer a chance to finish
-    halt_info.stop_render_loop = 1;
-    for (int trys=10; halt_info.stop_render_loop && trys > 0; trys--) {
-        usleep(10000);
-    }
-    // If render loop failed to stop it's self
-    if (halt_info.stop_render_loop && VERBOSE)
-        cflp_warning("Failed to quit GStreamer");
-
-    // Cancel all threads
+    // Stop the worker threads before tearing down what they use. Each one
+    // is only cancellable while it sleeps or waits, so it stops promptly and
+    // never while holding a lock.
+    if (VERBOSE)
+        cflp_info("Stopping worker threads...");
     for (uint i=0; threads[i] != 0; i++) {
         if (pthread_self() != threads[i])
             pthread_cancel(threads[i]);
     }
+    for (uint i=0; threads[i] != 0; i++) {
+        if (pthread_self() != threads[i])
+            pthread_join(threads[i], NULL);
+        threads[i] = 0;
+    }
+
+    // Release the frame the renderer still holds while the pipeline that
+    // produced it exists: hardware decoders back frames with device memory
+    // that cannot be unmapped once the decoder is gone
+    pthread_mutex_lock(&video_mutex);
+    release_video_frame_locked();
+    pthread_mutex_unlock(&video_mutex);
 
     // Clean up texture manager
     cleanup_texture_manager();
@@ -437,9 +444,6 @@ static void exit_cleanup() {
         allocated_uri = NULL;
     }
 
-    if (egl_context)
-        eglDestroyContext(egl_display, egl_context);
-    
     // Free allocated memory
     if (gst_options && strlen(gst_options) > 0)
         free((void*)gst_options);
@@ -475,12 +479,6 @@ static void exit_cleanup() {
         free(halt_info.stoplist);
     }
     
-    // Clean up video frame data
-    pthread_mutex_lock(&video_mutex);
-    // CHANGED 2026-07-08 - Ownership-aware release (unmap/unref or g_free) - Problem: frame may be a mapped GstBuffer now
-    release_video_frame_locked();
-    pthread_mutex_unlock(&video_mutex);
-
     // CHANGED 2026-07-09 - Release cached caps ref (safe here: pipeline is torn down, probe can no longer fire) - Problem: cached_caps leaked one GstCaps ref at exit
     release_cached_caps();
     
@@ -501,6 +499,32 @@ static void exit_cleanup() {
         glDeleteProgram(shader_program);
         shader_program = 0;
     }
+
+    // With every GL object deleted, release the surfaces, the context and
+    // the display, then the Wayland connection. Leaving them to the drivers'
+    // exit-time destructors is where EGL-on-Wayland drivers can hang.
+    if (VERBOSE)
+        cflp_info("Releasing EGL and Wayland resources...");
+    if (global_state) {
+        struct display_output *output, *tmp_output;
+        wl_list_for_each_safe(output, tmp_output, &global_state->outputs, link) {
+            destroy_display_output(output);
+        }
+    }
+    if (egl_display) {
+        eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (egl_context)
+            eglDestroyContext(egl_display, egl_context);
+        egl_context = NULL;
+        eglTerminate(egl_display);
+        egl_display = NULL;
+    }
+    if (global_state && global_state->display) {
+        wl_display_disconnect(global_state->display);
+        global_state->display = NULL;
+    }
+    if (VERBOSE)
+        cflp_info("Cleanup finished");
 
     // Free IPC socket path
     if (ipc_socket_path) {
@@ -636,9 +660,27 @@ static void upload_frame_to_texture(GLuint texture, const void *data, gsize size
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
+// Set once shutdown starts. A second exit signal (Ctrl+C again) then ends
+// the process at once, and a watchdog does the same if shutdown stalls, so
+// a hung driver or pipeline never needs kill -9.
+static volatile sig_atomic_t exit_in_progress = 0;
+#define EXIT_WATCHDOG_SECS 10
+
+static void handle_exit_watchdog(int signum) {
+    (void)signum;
+    static const char msg[] = "gslapper: shutdown did not finish in time, forcing exit\n";
+    if (write(STDERR_FILENO, msg, sizeof(msg) - 1) < 0) {
+        // nothing else can be done from a signal handler
+    }
+    _exit(EXIT_FAILURE);
+}
+
 static void exit_slapper(int reason) {
     if (VERBOSE)
         cflp_info("Exiting slapper");
+    exit_in_progress = 1;
+    signal(SIGALRM, handle_exit_watchdog);
+    alarm(EXIT_WATCHDOG_SECS);
     exit_cleanup();
     exit(reason);
 }
@@ -654,6 +696,13 @@ static void exit_slapper(int reason) {
 static volatile sig_atomic_t pending_signal = 0;
 
 static void handle_signal(int signum) {
+    if (exit_in_progress && signum != SIGHUP) {
+        static const char msg[] = "gslapper: exiting immediately\n";
+        if (write(STDERR_FILENO, msg, sizeof(msg) - 1) < 0) {
+            // nothing else can be done from a signal handler
+        }
+        _exit(128 + signum);
+    }
     pending_signal = signum;
 }
 
@@ -695,7 +744,6 @@ static void process_pending_signal(void) {
     if (signum == SIGHUP) {
         // SIGHUP means reload - save state and restart gracefully
         cflp_info("Received SIGHUP, saving state for reload...");
-        save_current_state();
 
         // Notify systemd we're reloading (optional)
         #ifdef HAVE_SYSTEMD
@@ -703,16 +751,12 @@ static void process_pending_signal(void) {
         #endif
 
         // Clean exit - systemd will restart us with --restore
-        exit_cleanup();
-        exit(EXIT_SUCCESS);
+        exit_slapper(EXIT_SUCCESS);
     } else {
-        // SIGINT, SIGTERM, SIGQUIT - clean exit
+        // SIGINT, SIGTERM, SIGQUIT - clean exit (exit_cleanup saves the state)
         if (VERBOSE)
             cflp_info("Signal %d received, exiting...", signum);
-
-        save_current_state();
-        exit_cleanup();
-        exit(EXIT_SUCCESS);
+        exit_slapper(EXIT_SUCCESS);
     }
 }
 
@@ -727,9 +771,7 @@ static void process_pending_stop(void) {
 
     if (request == STOP_REQ_EXIT) {
         cflp_error("Fatal GStreamer error, exiting...");
-        save_current_state();
-        exit_cleanup();
-        exit(EXIT_FAILURE);
+        exit_slapper(EXIT_FAILURE);
     }
 
     // STOP_REQ_RESTART
@@ -4216,6 +4258,9 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
     fcntl(wakeup_pipe[0], F_SETFD, FD_CLOEXEC);
+    // Writers only need the main loop to wake up; a full pipe already does
+    // that, so a write must never block a streaming or monitor thread
+    fcntl(wakeup_pipe[1], F_SETFL, fcntl(wakeup_pipe[1], F_GETFL) | O_NONBLOCK);
     fcntl(wakeup_pipe[1], F_SETFD, FD_CLOEXEC);
 
     // Connect to Wayland compositor
@@ -4358,11 +4403,6 @@ int main(int argc, char **argv) {
         // During transitions, frame callbacks will fire here and trigger render() via frame_handle_done()
         if (wl_display_dispatch_pending(state.display) == -1)
             break;
-
-        if (halt_info.stop_render_loop) {
-            halt_info.stop_render_loop = 0;
-            sleep(2); // Wait at least 2 secs to be killed
-        }
 
         // Handle frame rendering
         if (fds[1].revents & POLLIN) {
