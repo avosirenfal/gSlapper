@@ -40,9 +40,11 @@ gslapper --help
 
 ## Playback Control
 
+Playback always pauses on its own while no monitor shows the wallpaper, for example when the only monitor is unplugged or switched off at the wall, and resumes when one comes back. gSlapper also starts fine with no monitor connected: it waits, and the wallpaper appears when one connects. A service manager does not need to restart it.
+
 ### `-p, --auto-pause`
 
-Automatically pause when wallpaper is hidden.
+Also pause while the compositor is not presenting the wallpaper, such as when monitors are put to sleep (`niri msg action power-off-monitors`, DPMS). Every frame gSlapper draws asks the compositor to report when it is shown; when no report has arrived for two seconds, the wallpaper counts as hidden.
 
 ```bash
 gslapper -p -o "loop" DP-1 video.mp4
@@ -50,7 +52,7 @@ gslapper -p -o "loop" DP-1 video.mp4
 
 ### `-s, --auto-stop`
 
-Automatically stop when wallpaper is hidden.
+Like `--auto-pause`, but stops the process while the wallpaper is hidden and restarts it when it is shown again, freeing all decoder memory in between.
 
 ```bash
 gslapper -s -o "loop" DP-1 video.mp4

@@ -79,6 +79,7 @@ struct display_output {
     struct wl_list link;
 
     struct wl_callback *frame_callback;
+    int64_t frame_requested_us; // when frame_callback was requested
     bool redraw_needed;
 };
 
@@ -195,15 +196,33 @@ static bool restore_paused = false;
 // halt_info.is_paused for their own holds but never touch this flag.
 static bool ipc_paused = false;
 
-// --niri: pause while niri reports a focused fullscreen window.
-// The monitor thread publishes its decision in niri_wants_pause and wakes the
-// main loop, which reconciles it into the niri_paused hold (see
-// process_niri_pause()). Like ipc_paused, niri_paused is written only from
-// the main loop.
+// An automatic reason to keep playback paused. Each hold that is held adds
+// one to halt_info.is_paused, alongside IPC's, so they combine: playback
+// resumes once nothing holds it. Holds are taken and released only from the
+// main loop (see set_pause_hold()).
+typedef struct {
+    bool held;
+    const char *pause_message;
+    const char *resume_message;
+} pause_hold;
+
+// No output shows the wallpaper: none connected, or none matching the
+// selected output name. Always active.
+static pause_hold no_output_hold = {
+    false, "Pausing: no output shows the wallpaper", "Resuming: an output shows the wallpaper again"};
+// --auto-pause: the compositor stopped presenting the wallpaper (see
+// wallpaper_visibility_now()).
+static pause_hold hidden_hold = {
+    false, "Pausing because the wallpaper is hidden", "Resuming: the wallpaper is visible again"};
+// --niri: niri reports a focused fullscreen window. The monitor thread
+// publishes its decision in niri_wants_pause and wakes the main loop, which
+// applies it in process_niri_pause().
+static pause_hold niri_hold = {
+    false, "Pausing because a fullscreen window is focused in niri",
+    "Releasing niri pause: no fullscreen window is focused"};
 static bool niri_enabled = false;
 static niri_monitor_config niri_config = {0};
 static atomic_bool niri_wants_pause = false;
-static bool niri_paused = false;
 
 // Folder slideshow, active when the wallpaper path names a folder (see
 // start_slideshow()). The slideshow owns its pipelines; `pipeline` holds an
@@ -288,12 +307,10 @@ static struct {
     bool auto_stop;
 
     int is_paused;
-    bool frame_ready;
-
 } halt_info = {0};
 
-// gst events, auto-pause/stop, pauselist, stoplist, niri, plus the 0 terminator
-static pthread_t threads[6] = {0};
+// gst events, pauselist, stoplist, niri, plus the 0 terminator
+static pthread_t threads[5] = {0};
 
 static uint SLIDESHOW_TIME = 0;
 static bool SHOW_OUTPUTS = false;
@@ -661,9 +678,9 @@ static void upload_frame_to_texture(GLuint texture, const void *data, gsize size
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-// Set once shutdown starts. A second exit signal (Ctrl+C again) then ends
-// the process at once, and a watchdog does the same if shutdown stalls, so
-// a hung driver or pipeline never needs kill -9.
+// Set once shutdown starts. A second exit signal (Ctrl+C again) ends the
+// process at once (see handle_signal()), and a watchdog does the same if
+// shutdown stalls, so a hung driver or pipeline never needs kill -9.
 static volatile sig_atomic_t exit_in_progress = 0;
 #define EXIT_WATCHDOG_SECS 10
 
@@ -697,7 +714,10 @@ static void exit_slapper(int reason) {
 static volatile sig_atomic_t pending_signal = 0;
 
 static void handle_signal(int signum) {
-    if (exit_in_progress && signum != SIGHUP) {
+    // A second exit signal ends the process at once, whether shutdown is
+    // already running or the main loop is stuck and never handled the first
+    bool exit_pending = pending_signal != 0 && pending_signal != SIGHUP;
+    if ((exit_in_progress || exit_pending) && signum != SIGHUP) {
         static const char msg[] = "gslapper: exiting immediately\n";
         if (write(STDERR_FILENO, msg, sizeof(msg) - 1) < 0) {
             // nothing else can be done from a signal handler
@@ -761,7 +781,7 @@ static void process_pending_signal(void) {
     }
 }
 
-// Performs the teardown work monitor_stoplist/handle_auto_stop and the
+// Performs the teardown work monitor_stoplist and the
 // GStreamer bus error path requested, from main-loop context. Called from
 // the main loop and from init/reload wait loops, next to
 // process_pending_signal().
@@ -1518,6 +1538,7 @@ static void render(struct display_output *output) {
     if (using_waylandsink) {
         // Just schedule the next frame callback
         output->frame_callback = wl_surface_frame(output->surface);
+        output->frame_requested_us = g_get_monotonic_time();
         wl_callback_add_listener(output->frame_callback, &wl_surface_frame_listener, output);
         output->redraw_needed = false;
         return;
@@ -1552,45 +1573,26 @@ static void render(struct display_output *output) {
     if (!eglSwapBuffers(egl_display, output->egl_surface))
         cflp_error("Failed to swap egl buffers");
 
-    // Create frame callback for next frame
-    // During transitions, we always want a callback to ensure continuous rendering
-    // For normal rendering, we only create callback if redraw is needed
-    if (continuous_render_needed() || output->redraw_needed) {
-        // Destroy any existing callback first (shouldn't happen, but be safe)
-        if (output->frame_callback) {
-            wl_callback_destroy(output->frame_callback);
-            output->frame_callback = NULL;
-        }
-        
-        output->frame_callback = wl_surface_frame(output->surface);
-        wl_callback_add_listener(output->frame_callback, &wl_surface_frame_listener, output);
-        
-        // During transitions, keep redraw_needed true to ensure continuous rendering
-        if (continuous_render_needed()) {
-            output->redraw_needed = true;
-        } else {
-            output->redraw_needed = false;
-        }
-        
-        // Commit the surface to make the new buffer visible and trigger frame callback
-        // This is critical for transitions - without commit, the compositor won't display
-        // the frame or send the frame callback, breaking the render loop
-        wl_surface_commit(output->surface);
-        
-        // Flush Wayland connection to send frame request immediately
-        // This ensures the compositor receives the callback request right away
-        if (global_state && global_state->display) {
-            wl_display_flush(global_state->display);
-        }
-    } else {
-        // No callback needed - clear any existing one
-        if (output->frame_callback) {
-            wl_callback_destroy(output->frame_callback);
-            output->frame_callback = NULL;
-        }
-        output->redraw_needed = false;
+    // Ask to be told when the compositor presents this frame. The callback
+    // paces rendering to the display (new frames wait for it, see the main
+    // loop), and an answer that never comes tells --auto-pause the wallpaper
+    // is hidden (see wallpaper_visibility_now()).
+    if (output->frame_callback)
+        wl_callback_destroy(output->frame_callback);
+    output->frame_callback = wl_surface_frame(output->surface);
+    output->frame_requested_us = g_get_monotonic_time();
+    wl_callback_add_listener(output->frame_callback, &wl_surface_frame_listener, output);
+
+    // During transitions, keep redraw_needed true to ensure continuous rendering
+    output->redraw_needed = continuous_render_needed();
+
+    // Commit the surface so the compositor registers the frame callback
+    wl_surface_commit(output->surface);
+
+    // Flush Wayland connection to send frame request immediately
+    if (global_state && global_state->display) {
+        wl_display_flush(global_state->display);
     }
-    
 }
 
 static void frame_handle_done(void *data, struct wl_callback *callback, uint32_t frame_time) {
@@ -1600,9 +1602,6 @@ static void frame_handle_done(void *data, struct wl_callback *callback, uint32_t
 
     // Display is ready for new frame
     output->frame_callback = NULL;
-
-    // Reset deadman switch timer
-    halt_info.frame_ready = 1;
 
 
     // Always render if transition is active or redraw is needed
@@ -1668,10 +1667,12 @@ static void save_current_state(void) {
             if (gst_element_query_position(pipeline, GST_FORMAT_TIME, &pos_ns)) {
                 state.position = (double)pos_ns / GST_SECOND;
             }
-            // A pause held only by --niri reflects the window layout at exit,
-            // not a choice to keep the wallpaper paused across restarts
-            bool niri_only_pause = niri_paused && halt_info.is_paused == 1;
-            state.paused = (gst_state == GST_STATE_PAUSED) && !niri_only_pause;
+            // A pause held only by automatic holds reflects the session at
+            // exit (no monitor, a fullscreen window), not a choice to keep the
+            // wallpaper paused across restarts
+            int automatic_holds = no_output_hold.held + hidden_hold.held + niri_hold.held;
+            bool only_automatic = automatic_holds > 0 && halt_info.is_paused == automatic_holds;
+            state.paused = (gst_state == GST_STATE_PAUSED) && !only_automatic;
         } else {
             // Pipeline shutting down, use last known position or 0
             state.position = 0.0;
@@ -2019,53 +2020,68 @@ static void *monitor_stoplist(void *_) {
     pthread_exit(NULL);
 }
 
-static void *handle_auto_pause(void *_) {
-    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+// Takes or releases a pause hold. Static images are left alone: their frame
+// is already on screen and their pipeline is stopped once decoded, so
+// changing its state would only decode the image again.
+static void set_pause_hold(pause_hold *hold, bool wanted) {
+    if (wanted == hold->held)
+        return;
+    hold->held = wanted;
+    if (VERBOSE)
+        cflp_info("%s", wanted ? hold->pause_message : hold->resume_message);
 
-    while (halt_info.auto_pause) {
-
-        // Set deadman switch timer
-        halt_info.frame_ready = 0;
-        pthread_sleep(2);
-        if (!halt_info.frame_ready && !halt_info.is_paused) {
-            if (VERBOSE)
-                cflp_info("Pausing because clappie is hidden");
-            // For GStreamer, we pause the pipeline
-            if (pipeline)
-                gst_element_set_state(pipeline, GST_STATE_PAUSED);
-            halt_info.is_paused += 1;
-
-            while (!halt_info.frame_ready) {
-                pthread_usleep(10000);
-            }
-            if (halt_info.is_paused)
-                halt_info.is_paused -= 1;
-            // CHANGED 2026-02-21 04:30 - Resume pipeline after auto-pause hidden state clears - Problem: wallpaper could remain frozen after becoming visible again
-            if (!halt_info.is_paused && pipeline)
-                gst_element_set_state(pipeline, GST_STATE_PLAYING);
-        }
+    if (wanted) {
+        halt_info.is_paused++;
+        if (pipeline && !is_image_mode)
+            gst_element_set_state(pipeline, GST_STATE_PAUSED);
+    } else {
+        if (halt_info.is_paused > 0)
+            halt_info.is_paused--;
+        if (!halt_info.is_paused && pipeline && !is_image_mode)
+            gst_element_set_state(pipeline, GST_STATE_PLAYING);
     }
-    pthread_exit(NULL);
 }
 
-static void *handle_auto_stop(void *_) {
-    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+// How long the compositor may leave a frame callback unanswered before the
+// wallpaper counts as hidden.
+#define HIDDEN_AFTER_US (2 * G_USEC_PER_SEC)
 
-    while (halt_info.auto_stop) {
+typedef enum {
+    WALLPAPER_NO_OUTPUT, // no output has a wallpaper surface
+    WALLPAPER_HIDDEN,    // the compositor stopped presenting every surface
+    WALLPAPER_VISIBLE,
+} wallpaper_visibility;
 
-        // Set deadman switch timer
-        halt_info.frame_ready = 0;
-        pthread_sleep(2);
-        if (!halt_info.frame_ready) {
-            if (VERBOSE)
-                cflp_info("Stopping because clappie is hidden");
-            // CHANGED 2026-09-30 - Request stop instead of tearing down here - Problem:
-            // exit_cleanup() frees the pipeline/EGL/video_path this main loop is using;
-            // teardown must happen on the main thread (see process_pending_stop())
-            request_stop_from_thread(STOP_REQ_RESTART);
-        }
+// Every drawn frame asks the compositor for a frame callback (see render()).
+// Compositors answer it when they present the surface and hold it back while
+// the surface is not shown, for example when the monitor is off. An output
+// counts as visible unless its callback has been outstanding for
+// HIDDEN_AFTER_US; one that is not drawing (a still image) has none
+// outstanding, and its last frame was presented.
+static wallpaper_visibility wallpaper_visibility_now(const struct wl_state *state, int64_t now_us) {
+    bool any_surface = false;
+    const struct display_output *output;
+    wl_list_for_each(output, &state->outputs, link) {
+        if (!output->layer_surface)
+            continue;
+        any_surface = true;
+        if (!output->frame_callback || now_us - output->frame_requested_us < HIDDEN_AFTER_US)
+            return WALLPAPER_VISIBLE;
     }
-    pthread_exit(NULL);
+    return any_surface ? WALLPAPER_HIDDEN : WALLPAPER_NO_OUTPUT;
+}
+
+// Applies the visibility-driven holds and --auto-stop. Called from the main loop.
+static void process_visibility(const struct wl_state *state) {
+    wallpaper_visibility visibility = wallpaper_visibility_now(state, g_get_monotonic_time());
+    set_pause_hold(&no_output_hold, visibility == WALLPAPER_NO_OUTPUT);
+    if (halt_info.auto_pause) {
+        set_pause_hold(&hidden_hold, visibility == WALLPAPER_HIDDEN);
+    } else if (halt_info.auto_stop && visibility == WALLPAPER_HIDDEN) {
+        if (VERBOSE)
+            cflp_info("Stopping because the wallpaper is hidden");
+        stop_slapper();
+    }
 }
 
 // Runs on the niri monitor thread. Records the decision and wakes the main
@@ -2078,28 +2094,9 @@ static void niri_pause_changed(bool should_pause, void *userdata) {
     }
 }
 
-// Takes or releases the --niri pause hold to match the monitor's latest
-// decision. Called from the main loop.
+// Applies the --niri monitor's latest decision. Called from the main loop.
 static void process_niri_pause(void) {
-    bool wants_pause = atomic_load(&niri_wants_pause);
-    if (wants_pause == niri_paused)
-        return;
-    niri_paused = wants_pause;
-
-    if (wants_pause) {
-        if (VERBOSE)
-            cflp_info("Pausing because a fullscreen window is focused in niri");
-        halt_info.is_paused++;
-        if (pipeline)
-            gst_element_set_state(pipeline, GST_STATE_PAUSED);
-    } else {
-        if (VERBOSE)
-            cflp_info("Releasing niri pause: no fullscreen window is focused");
-        if (halt_info.is_paused > 0)
-            halt_info.is_paused--;
-        if (!halt_info.is_paused && pipeline)
-            gst_element_set_state(pipeline, GST_STATE_PLAYING);
-    }
+    set_pause_hold(&niri_hold, atomic_load(&niri_wants_pause));
 }
 
 // GStreamer event handling
@@ -2281,9 +2278,15 @@ static gboolean bus_callback(GstBus *bus, GstMessage *msg, gpointer data) {
                             cflp_info("Setting up seamless segment-based looping");
                         gif_loop_start_us = g_get_monotonic_time();
 
-                        // Perform initial seek to enable segment looping
+                        // Perform initial seek to enable segment looping.
+                        // It must flush: this runs on the events thread after
+                        // the PLAYING message, by which time the main loop may
+                        // already have paused the pipeline (IPC, --niri, no
+                        // output yet), and a non-flushing seek then waits on
+                        // the prerolled sink forever, holding the pipeline's
+                        // locks and freezing the next state change.
                         if (!gst_element_seek(pipeline, 1.0, GST_FORMAT_TIME,
-                                            GST_SEEK_FLAG_SEGMENT,
+                                            GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_SEGMENT,
                                             GST_SEEK_TYPE_SET, 0,
                                             GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE)) {
                             cflp_warning("Failed to initialize segment looping - falling back to EOS method");
@@ -2753,15 +2756,6 @@ static void init_threads() {
 
     pthread_create(&threads[id], NULL, handle_gst_events, NULL);
     id++;
-
-    // Thread for monitoring if clappie is hidden
-    if (halt_info.auto_pause) {
-        pthread_create(&threads[id], NULL, handle_auto_pause, NULL);
-        id++;
-    } else if (halt_info.auto_stop) {
-        pthread_create(&threads[id], NULL, handle_auto_stop, NULL);
-        id++;
-    }
 
     // Threads for monitoring watch lists
     if (halt_info.pauselist) {
@@ -4336,10 +4330,11 @@ int main(int argc, char **argv) {
     wl_display_roundtrip(state.display);
     if (SHOW_OUTPUTS)
         exit(EXIT_SUCCESS);
-    if (wl_list_empty(&state.outputs)) {
-        cflp_error(":/ sorry about this but we can't seem to find any output.");
-        return EXIT_FAILURE;
-    }
+    // With no matching output yet (monitor off or unplugged), keep running:
+    // the wallpaper appears when one connects, and playback stays paused
+    // until then (see no_output_hold)
+    if (wl_list_empty(&state.outputs))
+        cflp_warning("No output matching '%s' is connected yet; waiting for one", state.monitor);
 
     if (niri_enabled) {
         const char *niri_socket = getenv("NIRI_SOCKET");
@@ -4393,6 +4388,7 @@ int main(int argc, char **argv) {
 
         // Apply the latest --niri fullscreen decision (see niri_pause_changed()).
         process_niri_pause();
+        process_visibility(&state);
 
         if (slideshow_instance)
             advance_slideshow();
