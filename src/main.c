@@ -2044,7 +2044,11 @@ static void set_pause_hold(pause_hold *hold, bool wanted) {
 
 // How long the compositor may leave a frame callback unanswered before the
 // wallpaper counts as hidden.
-#define HIDDEN_AFTER_US (2 * G_USEC_PER_SEC)
+// niri answers callbacks of covered surfaces too, from a fallback timer that
+// leaves at most ~2 s between them, and stops entirely only while the
+// monitors are off; the margin above that keeps a wallpaper under a
+// fullscreen window from ever counting as hidden.
+#define HIDDEN_AFTER_US (3 * G_USEC_PER_SEC)
 
 typedef enum {
     WALLPAPER_NO_OUTPUT, // no output has a wallpaper surface
@@ -2072,8 +2076,12 @@ static wallpaper_visibility wallpaper_visibility_now(const struct wl_state *stat
 }
 
 // Applies the visibility-driven holds and --auto-stop. Called from the main loop.
+// The latest result of wallpaper_visibility_now(), for the slideshow clock
+static wallpaper_visibility current_visibility = WALLPAPER_VISIBLE;
+
 static void process_visibility(const struct wl_state *state) {
     wallpaper_visibility visibility = wallpaper_visibility_now(state, g_get_monotonic_time());
+    current_visibility = visibility;
     set_pause_hold(&no_output_hold, visibility == WALLPAPER_NO_OUTPUT);
     if (halt_info.auto_pause) {
         set_pause_hold(&hidden_hold, visibility == WALLPAPER_HIDDEN);
@@ -2734,9 +2742,12 @@ static void start_slideshow(void) {
 
 // Advances the slideshow's schedule. Called from the main loop.
 static void advance_slideshow(void) {
-    // Only a pause asked for over IPC stops the slideshow's clock; automatic
-    // pauses (--niri, hidden, no output) keep the rotation on schedule
-    slideshow_playback playback = ipc_paused ? SLIDESHOW_FROZEN
+    // The clock stops while nobody can see the wallpaper (no monitor, or
+    // monitors asleep, with or without --auto-pause) and on an IPC pause.
+    // Other pauses, such as --niri's fullscreen window, keep the rotation
+    // on schedule.
+    bool monitor_off = current_visibility != WALLPAPER_VISIBLE;
+    slideshow_playback playback = ipc_paused || monitor_off ? SLIDESHOW_FROZEN
                                   : halt_info.is_paused > 0 ? SLIDESHOW_PAUSED
                                   : SLIDESHOW_PLAYING;
     bool changed = slideshow_tick(slideshow_instance, g_get_monotonic_time(), playback);

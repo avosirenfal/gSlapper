@@ -44,7 +44,7 @@ Playback always pauses on its own while no monitor shows the wallpaper, for exam
 
 ### `-p, --auto-pause`
 
-Also pause while the compositor is not presenting the wallpaper, such as when monitors are put to sleep (`niri msg action power-off-monitors`, DPMS). Every frame gSlapper draws asks the compositor to report when it is shown; when no report has arrived for two seconds, the wallpaper counts as hidden.
+Also pause while the compositor is not presenting the wallpaper, such as when monitors are put to sleep (`niri msg action power-off-monitors`, DPMS). Every frame gSlapper draws asks the compositor to report when it is shown; when no report has arrived for three seconds, the wallpaper counts as hidden. niri keeps reporting about once a second for a wallpaper covered by a window, so on niri this only happens while the monitors are off; use `--niri` to pause under fullscreen windows.
 
 ```bash
 gslapper -p -o "loop" DP-1 video.mp4
@@ -92,7 +92,7 @@ gslapper -n 300 --transition-type fade --transition-duration 2 -o "fill no-audio
 
 Items play in natural file-name order (`clip2` before `clip10`), wrapping around at the end, or in random order with `--shuffle`. Videos shorter than their turn loop; longer ones are cut off by the next crossfade. The `-o` scaling mode applies to every item, so `fill` is usually what you want for a folder that mixes images and videos.
 
-The folder is read again before every switch, so you can add, rename or delete files while gSlapper runs. A file is picked up once it has stopped changing for a few seconds (so a copy in progress is not shown half-written), and a file that cannot be played is skipped. Automatic pauses (`--niri`, `--auto-pause`, no monitor connected) pause playback but keep the slideshow on schedule, so the right item is showing when the wallpaper comes back. An IPC `pause` stops the clock as well: the current item stays until you `resume`.
+The folder is read again before every switch, so you can add, rename or delete files while gSlapper runs. A file is picked up once it has stopped changing for a few seconds (so a copy in progress is not shown half-written), and a file that cannot be played is skipped. While the monitor is off (unplugged, or asleep through `niri msg action power-off-monitors` or an idle timeout) the slideshow holds still, with or without `--auto-pause`, and an IPC `pause` holds it as well: the current item stays until the monitor comes back or you `resume`. A fullscreen window paused by `--niri` only pauses playback; the slideshow keeps its schedule, so the right item is showing when the window goes away.
 
 ### `-n, --slideshow SECS`
 

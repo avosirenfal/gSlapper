@@ -43,12 +43,13 @@ void slideshow_free(slideshow *show);
 // How the slideshow should run right now.
 typedef enum {
     SLIDESHOW_PLAYING,
-    // Playback paused for an automatic reason (a fullscreen window, the
-    // wallpaper hidden, no monitor): items keep switching on schedule, so
-    // the rotation is where it should be once the wallpaper shows again
+    // Playback paused while the wallpaper is merely covered (a fullscreen
+    // window): items keep switching on schedule, so the rotation is where it
+    // should be once the window goes away
     SLIDESHOW_PAUSED,
-    // Paused on request (IPC pause): the clock stops too, and the current
-    // item stays until playback resumes
+    // Nobody can see the wallpaper (monitor off) or playback was paused on
+    // request (IPC pause): the clock stops too, and the current item stays
+    // until playback resumes
     SLIDESHOW_FROZEN,
 } slideshow_playback;
 
