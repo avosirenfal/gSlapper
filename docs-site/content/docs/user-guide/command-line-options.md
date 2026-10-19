@@ -92,7 +92,7 @@ gslapper -n 300 --transition-type fade --transition-duration 2 -o "fill no-audio
 
 Items play in natural file-name order (`clip2` before `clip10`), wrapping around at the end, or in random order with `--shuffle`. Videos shorter than their turn loop; longer ones are cut off by the next crossfade. The `-o` scaling mode applies to every item, so `fill` is usually what you want for a folder that mixes images and videos.
 
-The folder is read again before every switch, so you can add, rename or delete files while gSlapper runs. A file is picked up once it has stopped changing for a few seconds (so a copy in progress is not shown half-written), and a file that cannot be played is skipped. Pausing, by IPC, `--auto-pause` or `--niri`, also stops the clock, so items do not rotate while the wallpaper is paused.
+The folder is read again before every switch, so you can add, rename or delete files while gSlapper runs. A file is picked up once it has stopped changing for a few seconds (so a copy in progress is not shown half-written), and a file that cannot be played is skipped. Automatic pauses (`--niri`, `--auto-pause`, no monitor connected) pause playback but keep the slideshow on schedule, so the right item is showing when the wallpaper comes back. An IPC `pause` stops the clock as well: the current item stays until you `resume`.
 
 ### `-n, --slideshow SECS`
 
@@ -104,7 +104,7 @@ Crossfades use the transition options: with `--transition-type fade` the switch 
 
 ### `--shuffle`
 
-Plays the folder in random order instead of by name. Every file is shown once per round before any repeats, files added mid-round join the current round, and the same file never plays twice in a row, even across rounds.
+Plays the folder in random order instead of by name, like dealing from a shuffled deck: every file is shown once before any file repeats, then the deck is reshuffled. A file added mid-round is shuffled into the rest of the current round, a deleted one is skipped, and the same file never plays twice in a row, even across rounds.
 
 ```bash
 gslapper --shuffle -n 300 --transition-type fade --transition-duration 2 -o "fill no-audio" DP-1 ~/Wallpapers

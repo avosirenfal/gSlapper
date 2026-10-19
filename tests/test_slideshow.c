@@ -149,9 +149,12 @@ static void test_playlist(void) {
 
 // ---- Scheduler ----
 
+#define LOG_CAPACITY 32
+
 typedef struct {
-    char shown[16][64];
+    char shown[LOG_CAPACITY][64]; // each item as it comes on screen
     size_t shown_count;
+    uint64_t last_slot_id;
     int frames;
     bool saw_two_layers;
     float max_incoming_opacity_seen;
@@ -163,20 +166,25 @@ static void drain(int fd) {
     }
 }
 
-// Ticks the slideshow like the main loop does, for `secs`, consuming frames
-// as the renderer would and recording each item that comes on screen.
-static void run_for(slideshow *show, int wakeup_fd, double secs, bool paused, run_log *log) {
+// Ticks the slideshow like the main loop does, for `secs` or until
+// `stop_at` items have been shown (0 for no limit), consuming frames as the
+// renderer would and recording each item that comes on screen. Items are
+// told apart by slot, so the same file shown twice in a row counts twice.
+static void run_for(slideshow *show, int wakeup_fd, double secs, slideshow_playback playback, size_t stop_at,
+                    run_log *log) {
     int64_t end = g_get_monotonic_time() + (int64_t)(secs * G_USEC_PER_SEC);
-    while (g_get_monotonic_time() < end) {
+    while (g_get_monotonic_time() < end && (stop_at == 0 || log->shown_count < stop_at)) {
         int64_t now = g_get_monotonic_time();
-        slideshow_tick(show, now, paused);
-        const char *name = slideshow_current_name(show);
-        if (name && (log->shown_count == 0 || strcmp(log->shown[log->shown_count - 1], name) != 0) &&
-            log->shown_count < 16)
-            g_strlcpy(log->shown[log->shown_count++], name, sizeof(log->shown[0]));
+        slideshow_tick(show, now, playback);
 
         slideshow_layer layers[2];
         size_t count = slideshow_layers(show, now, layers);
+        const char *name = slideshow_current_name(show);
+        if (count == 1 && name && media_slot_id(layers[0].slot) != log->last_slot_id &&
+            log->shown_count < LOG_CAPACITY) {
+            log->last_slot_id = media_slot_id(layers[0].slot);
+            g_strlcpy(log->shown[log->shown_count++], name, sizeof(log->shown[0]));
+        }
         if (count == 2) {
             log->saw_two_layers = true;
             if (layers[1].opacity > log->max_incoming_opacity_seen && layers[1].opacity < 1.0f)
@@ -231,7 +239,7 @@ static void test_shuffle(void) {
         .wakeup_fd = wakeup[1],
     });
     run_log log = {0};
-    run_for(show, wakeup[0], 6.0, false, &log);
+    run_for(show, wakeup[0], 6.0, SLIDESHOW_PLAYING, 0, &log);
     slideshow_free(show);
 
     // Rounds of the three playable files, each a permutation, never the
@@ -260,6 +268,76 @@ static void test_shuffle(void) {
     close(wakeup[1]);
 }
 
+// True when names[from..from+count) holds each of `expected` exactly once.
+static bool is_permutation(const run_log *log, size_t from, size_t count, const char *const *expected) {
+    if (from + count > log->shown_count)
+        return false;
+    for (size_t e = 0; e < count; e++) {
+        size_t hits = 0;
+        for (size_t i = from; i < from + count; i++)
+            hits += strcmp(log->shown[i], expected[e]) == 0;
+        if (hits != 1)
+            return false;
+    }
+    return true;
+}
+
+static void print_log(const char *label, const run_log *log) {
+    fprintf(stderr, "%s:", label);
+    for (size_t i = 0; i < log->shown_count; i++)
+        fprintf(stderr, " %s", log->shown[i]);
+    fprintf(stderr, "\n");
+}
+
+// Shuffle behaves like a shuffled deck: no file repeats until every file has
+// been shown, and a file added mid-round joins the rest of that round.
+static void test_shuffle_deck(void) {
+    char *deck_dir = g_build_filename(dir, "deck", NULL);
+    mkdir(deck_dir, 0755);
+    const char *names[] = {"s1.png", "s2.png", "s3.png", "s4.png", "s5.png", "s6.png", "s7_added_later.png"};
+    for (int i = 0; i < 6; i++) {
+        char *name = g_build_filename("deck", names[i], NULL);
+        CHECK(generate_image(name, "smpte"));
+        g_free(name);
+    }
+
+    int wakeup[2];
+    CHECK(pipe2(wakeup, O_NONBLOCK | O_CLOEXEC) == 0);
+    slideshow *show = slideshow_new((slideshow_config){
+        .directory = deck_dir,
+        .interval_secs = 0.3,
+        .fade_secs = 0,
+        .preload_limit_bytes = 64 * 1024 * 1024,
+        .shuffle = true,
+        .wakeup_fd = wakeup[1],
+    });
+
+    // Three items into the first round, a seventh file appears
+    run_log log = {0};
+    run_for(show, wakeup[0], 10.0, SLIDESHOW_PLAYING, 3, &log);
+    char *added = g_build_filename("deck", names[6], NULL);
+    CHECK(generate_image(added, "ball"));
+    g_free(added);
+    run_for(show, wakeup[0], 20.0, SLIDESHOW_PLAYING, 7 + 7 + 1, &log);
+    slideshow_free(show);
+
+    // Round one: all seven files once, the late one included; round two:
+    // all seven once again
+    if (!is_permutation(&log, 0, 7, names) || !is_permutation(&log, 7, 7, names)) {
+        print_log("shuffle deck", &log);
+        failures++;
+    }
+    for (size_t i = 1; i < log.shown_count; i++)
+        CHECK(strcmp(log.shown[i], log.shown[i - 1]) != 0);
+
+    close(wakeup[0]);
+    close(wakeup[1]);
+    char *cmd = g_strdup_printf("rm -rf '%s'", deck_dir);
+    CHECK(system(cmd) == 0);
+    g_free(cmd);
+    g_free(deck_dir);
+}
+
 static void test_rotation(void) {
     int wakeup[2];
     CHECK(pipe2(wakeup, O_NONBLOCK | O_CLOEXEC) == 0);
@@ -278,7 +356,7 @@ static void test_rotation(void) {
 
     // a.webm, b.png, c_broken.mp4 (skipped), d.webm, then a.webm again
     run_log log = {0};
-    run_for(show, wakeup[0], 4.6, false, &log);
+    run_for(show, wakeup[0], 4.6, SLIDESHOW_PLAYING, 0, &log);
     CHECK(log.shown_count >= 4);
     const char *expected[] = {"a.webm", "b.png", "d.webm", "a.webm"};
     for (size_t i = 0; i < 4 && i < log.shown_count; i++) {
@@ -291,13 +369,22 @@ static void test_rotation(void) {
     CHECK(log.max_incoming_opacity_seen > 0.2f);
     CHECK(log.frames > 10);
 
-    // Pausing freezes the rotation
+    // A requested pause freezes the rotation
     const char *before_pause = slideshow_current_name(show);
     char *paused_name = before_pause ? strdup(before_pause) : NULL;
-    run_log paused_log = {0};
-    run_for(show, wakeup[0], 2.0, true, &paused_log);
+    run_log frozen_log = {0};
+    run_for(show, wakeup[0], 2.0, SLIDESHOW_FROZEN, 0, &frozen_log);
     CHECK(paused_name && slideshow_current_name(show) && strcmp(paused_name, slideshow_current_name(show)) == 0);
+    CHECK(frozen_log.shown_count <= 1);
     free(paused_name);
+
+    // An automatic pause (a fullscreen window) keeps it on schedule: two
+    // seconds at one item per second brings two new items
+    run_log paused_log = {0};
+    run_for(show, wakeup[0], 2.3, SLIDESHOW_PAUSED, 0, &paused_log);
+    if (paused_log.shown_count < 3)
+        fprintf(stderr, "only %zu items while paused\n", paused_log.shown_count);
+    CHECK(paused_log.shown_count >= 3); // the item on screen when it started, then two more
 
     // Change the folder underneath it: delete every original, add one image
     const char *originals[] = {"a.webm", "b.png", "c_broken.mp4", "d.webm"};
@@ -308,7 +395,7 @@ static void test_rotation(void) {
     }
     CHECK(generate_image("e.png", "ball"));
     run_log changed = {0};
-    run_for(show, wakeup[0], 3.0, false, &changed);
+    run_for(show, wakeup[0], 3.0, SLIDESHOW_PLAYING, 0, &changed);
     // The item already playing came from memory, so it survived its file's
     // deletion; afterwards the rotation settles on the one remaining file
     CHECK(slideshow_current_name(show) && strcmp(slideshow_current_name(show), "e.png") == 0);
@@ -318,7 +405,7 @@ static void test_rotation(void) {
     unlink(e);
     g_free(e);
     run_log emptied = {0};
-    run_for(show, wakeup[0], 2.5, false, &emptied);
+    run_for(show, wakeup[0], 2.5, SLIDESHOW_PLAYING, 0, &emptied);
     CHECK(slideshow_current_name(show) && strcmp(slideshow_current_name(show), "e.png") == 0);
 
     slideshow_free(show);
@@ -340,6 +427,7 @@ int main(void) {
     test_playlist();
     test_playlist_random();
     test_shuffle();
+    test_shuffle_deck();
     test_rotation();
 
     char *cmd = g_strdup_printf("rm -rf '%s'", dir);

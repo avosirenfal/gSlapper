@@ -22,7 +22,7 @@ typedef struct {
     double fade_secs;           // crossfade length; 0 cuts directly
     size_t preload_limit_bytes; // larger files stream from disk instead of RAM
     bool audio;
-    bool shuffle;               // random order, each file once per round
+    bool shuffle;               // shuffled-deck order: each file once per round
     int wakeup_fd;              // written to when a slot has a new frame
     int verbose;
 } slideshow_config;
@@ -40,10 +40,21 @@ slideshow *slideshow_new(slideshow_config config);
 // Stops every slot and waits for their threads.
 void slideshow_free(slideshow *show);
 
-// Advances the schedule to now_us (g_get_monotonic_time()). Time spent
-// paused does not count toward an item's turn. Returns true when the set of
-// visible layers changed and every output should be redrawn.
-bool slideshow_tick(slideshow *show, int64_t now_us, bool paused);
+// How the slideshow should run right now.
+typedef enum {
+    SLIDESHOW_PLAYING,
+    // Playback paused for an automatic reason (a fullscreen window, the
+    // wallpaper hidden, no monitor): items keep switching on schedule, so
+    // the rotation is where it should be once the wallpaper shows again
+    SLIDESHOW_PAUSED,
+    // Paused on request (IPC pause): the clock stops too, and the current
+    // item stays until playback resumes
+    SLIDESHOW_FROZEN,
+} slideshow_playback;
+
+// Advances the schedule to now_us (g_get_monotonic_time()). Returns true
+// when the set of visible layers changed and every output should be redrawn.
+bool slideshow_tick(slideshow *show, int64_t now_us, slideshow_playback playback);
 
 // Fills up to two layers for drawing at now_us; returns how many.
 size_t slideshow_layers(const slideshow *show, int64_t now_us, slideshow_layer out[2]);

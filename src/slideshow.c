@@ -86,10 +86,10 @@ struct slideshow {
     media_slot *current; // on screen; NULL until the first item is ready
     media_slot *next;    // loading, ready, or fading in when `fading`
     bool fading;
-    double current_shown; // unpaused seconds since current began showing
+    double current_shown; // seconds on the clock since current began showing
     double fade_elapsed;
     int64_t last_tick_us;
-    bool paused;
+    slideshow_playback playback;
     int64_t retry_at_us;
     name_set failed; // names that failed since the last successful switch
     name_set played; // with shuffle: names shown in the current round
@@ -595,7 +595,7 @@ static void finish_switch(slideshow *show) {
 static void begin_switch(slideshow *show) {
     bool fade = show->current && show->config.fade_secs > 0;
     slot_set_volume(show->next, fade ? 0.0 : 1.0);
-    slot_set_playing(show->next, !show->paused);
+    slot_set_playing(show->next, show->playback == SLIDESHOW_PLAYING);
     show->fading = fade;
     show->fade_elapsed = 0;
     if (!fade)
@@ -658,22 +658,24 @@ void slideshow_free(slideshow *show) {
     free(show);
 }
 
-bool slideshow_tick(slideshow *show, int64_t now_us, bool paused) {
+bool slideshow_tick(slideshow *show, int64_t now_us, slideshow_playback playback) {
     double dt = show->last_tick_us ? (double)(now_us - show->last_tick_us) / G_USEC_PER_SEC : 0;
     show->last_tick_us = now_us;
-    if (!show->paused) {
+    // The interval since the last tick ran under the previous playback state
+    if (show->playback != SLIDESHOW_FROZEN) {
         show->current_shown += dt;
         if (show->fading)
             show->fade_elapsed += dt;
     }
     bool changed = false;
 
-    if (paused != show->paused) {
-        show->paused = paused;
+    if (playback != show->playback) {
+        show->playback = playback;
+        bool playing = playback == SLIDESHOW_PLAYING;
         if (show->current)
-            slot_set_playing(show->current, !paused);
+            slot_set_playing(show->current, playing);
         if (show->fading)
-            slot_set_playing(show->next, !paused);
+            slot_set_playing(show->next, playing);
     }
 
     // An incoming item that failed is dropped (mid-fade the outgoing one
@@ -721,7 +723,8 @@ size_t slideshow_layers(const slideshow *show, int64_t now_us, slideshow_layer o
         return count;
     }
     // Interpolate between ticks so the fade is as smooth as the frame rate
-    double since_tick = show->paused ? 0 : (double)(now_us - show->last_tick_us) / G_USEC_PER_SEC;
+    double since_tick =
+        show->playback == SLIDESHOW_FROZEN ? 0 : (double)(now_us - show->last_tick_us) / G_USEC_PER_SEC;
     float progress = (float)fade_progress(show, show->fade_elapsed + since_tick);
     if (show->current)
         out[count++] = (slideshow_layer){show->current, 1.0f - progress};

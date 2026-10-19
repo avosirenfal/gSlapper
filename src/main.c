@@ -2734,7 +2734,12 @@ static void start_slideshow(void) {
 
 // Advances the slideshow's schedule. Called from the main loop.
 static void advance_slideshow(void) {
-    bool changed = slideshow_tick(slideshow_instance, g_get_monotonic_time(), halt_info.is_paused > 0);
+    // Only a pause asked for over IPC stops the slideshow's clock; automatic
+    // pauses (--niri, hidden, no output) keep the rotation on schedule
+    slideshow_playback playback = ipc_paused ? SLIDESHOW_FROZEN
+                                  : halt_info.is_paused > 0 ? SLIDESHOW_PAUSED
+                                  : SLIDESHOW_PLAYING;
+    bool changed = slideshow_tick(slideshow_instance, g_get_monotonic_time(), playback);
 
     // Keep `pipeline` referencing the item on screen
     GstElement *current = slideshow_current_pipeline(slideshow_instance);
