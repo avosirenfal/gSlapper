@@ -3665,18 +3665,39 @@ static void init_egl(struct wl_state *state) {
 }
 
 // Wayland output management (copied from mpvpaper)
+// Tears an output down when its monitor goes away (or at exit). Nothing may
+// reach the output afterwards, and every layer must let go of the one below
+// it before that is destroyed: EGL surface, then wl_egl_window, then the
+// layer surface and wl_surface.
 static void destroy_display_output(struct display_output *output) {
     if (!output)
         return;
     wl_list_remove(&output->link);
+
+    // The pending frame callback carries this output as its listener data.
+    // Destroying it makes libwayland drop a "done" the compositor may already
+    // have queued, which would otherwise draw through the freed output.
+    if (output->frame_callback) {
+        wl_callback_destroy(output->frame_callback);
+        output->frame_callback = NULL;
+    }
+
+    if (output->egl_surface) {
+        // EGL defers destroying a surface that is current until it is
+        // released, by which time its wl_egl_window would be gone and the
+        // driver would touch freed memory. Release it first, keeping the
+        // context current where surfaceless contexts are supported.
+        if (eglGetCurrentSurface(EGL_DRAW) == output->egl_surface &&
+            !eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_context))
+            eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        eglDestroySurface(egl_display, output->egl_surface);
+    }
+    if (output->egl_window)
+        wl_egl_window_destroy(output->egl_window);
     if (output->layer_surface != NULL)
         zwlr_layer_surface_v1_destroy(output->layer_surface);
     if (output->surface != NULL)
         wl_surface_destroy(output->surface);
-    if (output->egl_surface)
-        eglDestroySurface(egl_display, output->egl_surface);
-    if (output->egl_window)
-        wl_egl_window_destroy(output->egl_window);
     wl_output_destroy(output->wl_output);
 
     free(output->name);
