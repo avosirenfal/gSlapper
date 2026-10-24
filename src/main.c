@@ -350,6 +350,16 @@ static bool is_all_outputs_selector(const char *monitor);
 static bool audio_disabled(void);
 static void destroy_display_output(struct display_output *output);
 
+// The shutdown step in progress, which the watchdog reports if shutdown
+// stalls (see exit_slapper()). Always points to a string literal.
+static const char *volatile shutdown_stage = "starting";
+
+static void shutdown_step(const char *stage) {
+    shutdown_stage = stage;
+    if (VERBOSE)
+        cflp_info("Shutdown: %s", stage);
+}
+
 // Cleanup function
 static void exit_cleanup() {
 
@@ -363,19 +373,20 @@ static void exit_cleanup() {
 
     // CRITICAL: Save state BEFORE GStreamer shutdown to avoid race conditions
     if (save_state_on_exit) {
+        shutdown_step("saving state");
         save_current_state();
     }
 
     // Shutdown IPC server first
     if (ipc_socket_path) {
+        shutdown_step("stopping the IPC server");
         ipc_shutdown();
     }
 
     // Stop the worker threads before tearing down what they use. Each one
     // is only cancellable while it sleeps or waits, so it stops promptly and
     // never while holding a lock.
-    if (VERBOSE)
-        cflp_info("Stopping worker threads...");
+    shutdown_step("stopping worker threads");
     for (uint i=0; threads[i] != 0; i++) {
         if (pthread_self() != threads[i])
             pthread_cancel(threads[i]);
@@ -389,11 +400,13 @@ static void exit_cleanup() {
     // Release the frame the renderer still holds while the pipeline that
     // produced it exists: hardware decoders back frames with device memory
     // that cannot be unmapped once the decoder is gone
+    shutdown_step("releasing the last video frame");
     pthread_mutex_lock(&video_mutex);
     release_video_frame_locked();
     pthread_mutex_unlock(&video_mutex);
 
     // Clean up texture manager
+    shutdown_step("releasing textures and the image cache");
     cleanup_texture_manager();
 
     // Clean up image cache
@@ -402,6 +415,7 @@ static void exit_cleanup() {
     // Stop the slideshow's pipelines. Drop the `pipeline` alias first: the
     // shutdown sequence below would otherwise restart a stopped slot pipeline.
     if (slideshow_instance) {
+        shutdown_step("stopping the slideshow");
         if (pipeline) {
             gst_object_unref(pipeline);
             pipeline = NULL;
@@ -428,8 +442,7 @@ static void exit_cleanup() {
     
     if (pipeline) {
         // More graceful GStreamer shutdown sequence
-        if (VERBOSE)
-            cflp_info("Starting graceful GStreamer shutdown...");
+        shutdown_step("stopping the GStreamer pipeline");
             
         // Remove bus watch to prevent callbacks during shutdown
         if (bus) {
@@ -451,9 +464,6 @@ static void exit_cleanup() {
         // Now unref the pipeline
         gst_object_unref(pipeline);
         pipeline = NULL;
-        
-        if (VERBOSE)
-            cflp_info("GStreamer shutdown completed");
     }
     
     // Clean up allocated URI
@@ -501,6 +511,7 @@ static void exit_cleanup() {
     release_cached_caps();
     
     // Clean up OpenGL resources
+    shutdown_step("releasing GL objects");
     if (video_texture != 0) {
         glDeleteTextures(1, &video_texture);
         video_texture = 0;
@@ -518,31 +529,12 @@ static void exit_cleanup() {
         shader_program = 0;
     }
 
-    // With every GL object deleted, release the surfaces, the context and
-    // the display, then the Wayland connection. Leaving them to the drivers'
-    // exit-time destructors is where EGL-on-Wayland drivers can hang.
-    if (VERBOSE)
-        cflp_info("Releasing EGL and Wayland resources...");
-    if (global_state) {
-        struct display_output *output, *tmp_output;
-        wl_list_for_each_safe(output, tmp_output, &global_state->outputs, link) {
-            destroy_display_output(output);
-        }
-    }
-    if (egl_display) {
-        eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        if (egl_context)
-            eglDestroyContext(egl_display, egl_context);
-        egl_context = NULL;
-        eglTerminate(egl_display);
-        egl_display = NULL;
-    }
-    if (global_state && global_state->display) {
-        wl_display_disconnect(global_state->display);
-        global_state->display = NULL;
-    }
-    if (VERBOSE)
-        cflp_info("Cleanup finished");
+    // The EGL context, the surfaces and the Wayland connection are left to the
+    // kernel and the compositor: the process ends right after this (see
+    // exit_slapper()) or execs gslapper-holder (see stop_slapper()), and
+    // tearing them down only adds calls into the GPU driver, the place
+    // shutdown has been seen to hang.
+    shutdown_step("cleanup finished");
 
     // Free IPC socket path
     if (ipc_socket_path) {
@@ -684,12 +676,18 @@ static void upload_frame_to_texture(GLuint texture, const void *data, gsize size
 static volatile sig_atomic_t exit_in_progress = 0;
 #define EXIT_WATCHDOG_SECS 10
 
-static void handle_exit_watchdog(int signum) {
-    (void)signum;
-    static const char msg[] = "gslapper: shutdown did not finish in time, forcing exit\n";
-    if (write(STDERR_FILENO, msg, sizeof(msg) - 1) < 0) {
+// write() and strlen() are async-signal-safe
+static void write_stderr(const char *text) {
+    if (write(STDERR_FILENO, text, strlen(text)) < 0) {
         // nothing else can be done from a signal handler
     }
+}
+
+static void handle_exit_watchdog(int signum) {
+    (void)signum;
+    write_stderr("gslapper: shutdown did not finish in time (stuck while ");
+    write_stderr(shutdown_stage);
+    write_stderr("), forcing exit\n");
     _exit(EXIT_FAILURE);
 }
 
@@ -700,7 +698,13 @@ static void exit_slapper(int reason) {
     signal(SIGALRM, handle_exit_watchdog);
     alarm(EXIT_WATCHDOG_SECS);
     exit_cleanup();
-    exit(reason);
+
+    // exit_cleanup() released everything gSlapper holds, so skip the
+    // libraries' exit-time destructors, which is where GPU drivers can hang
+    // after their resources are gone. Only buffered output needs flushing.
+    shutdown_step("flushing output");
+    fflush(NULL);
+    _exit(reason);
 }
 
 // CHANGED 2025-12-25 - Implemented SIGHUP reload functionality - Problem: Need config reload without restarting process
