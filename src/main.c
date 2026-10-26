@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <limits.h>
+#include <malloc.h>
 #include <mcheck.h>
 #include <poll.h>
 #include <pthread.h>
@@ -4228,6 +4229,16 @@ static void check_paper_processes() {
 int main(int argc, char **argv) {
     // Initialize mtrace for memory leak detection
     mtrace();
+
+    // Hand every allocation of 1 MiB or more straight back to the kernel
+    // when it is freed. Video frames are 8-33 MB at 4K and are allocated and
+    // freed on many GStreamer threads, and glibc's default threshold rises
+    // with each large free (up to 32 MB), after which frames come from
+    // per-thread arenas that keep the memory: a slideshow, which builds and
+    // tears down pipelines at every switch, grew past 1.3 GB in 40 s this
+    // way, against ~400 MB with the threshold fixed. Buffer pools reuse
+    // their frames, so the extra mmap/munmap calls are rare.
+    mallopt(M_MMAP_THRESHOLD, 1024 * 1024);
 
     // CHANGED 2025-12-25 - Added SIGHUP handler for config reload - Problem: Need runtime config reload support
     // CHANGED 2026-07-19 - Unblock signals after registering handlers - Problem: when gSlapper is spawned by a
